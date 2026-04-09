@@ -1,0 +1,21 @@
+[package]
+name = "simple"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+
+[lib]
+doctest = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+nalgebra = "0.34"
+ndarray = { version = "0.17", features = ["rayon"] }
+num-complex = "0.4"
+rand = { version = "0.10", features = ["std_rng"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = "debuginfo"

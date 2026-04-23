@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use ndarray::Array1;
+use num_complex::Complex64;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use simple::config::{SolverConfig, SpectrumTarget, recommended_ncv};
@@ -14,24 +15,23 @@ use simple::linalg::ops::{normalize, normalized_random_vector};
 use simple::memory;
 use simple::operator::{
     ConvectionDiffusionOperator, DenseMatrixOperator, GrcarOperator, IdentityOperator,
-    LinearOperator,
+    LinearOperator, parse_complex_token,
 };
 use simple::{IramError, solve};
 
-
 /// CLI
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Real nonsymmetric IRAM written with ndarray")]
+#[command(author, version, about = "Complex IRAM written with ndarray")]
 struct Cli {
     /// Размерность задачи
     #[arg(long, default_value_t = 32)]
     dimension: usize,
 
-    /// Размерность базиса Крылова
+    /// Искомое количество собственных значений
     #[arg(long, default_value_t = 1)]
     nev: usize,
 
-    /// Искомое количество собственных значений
+    /// Размерность базиса Крылова
     #[arg(long)]
     ncv: Option<usize>,
 
@@ -48,16 +48,14 @@ struct Cli {
     breakdown_tol: f64,
 
     /// Искомая часть спектра
-    /// См. [TargetArg]
     #[arg(long, value_enum, default_value_t = TargetArg::LargestMagnitude)]
     target: TargetArg,
 
     /// Название оператора
-    /// См. [build_operator], [OperatorArg] и [simple::operator]
     #[arg(long, value_enum, default_value_t = OperatorArg::Identity)]
     operator: OperatorArg,
 
-    /// Файл с разреженной матрицы
+    /// Файл с плотной матрицей
     #[arg(long)]
     matrix_file: Option<PathBuf>,
 
@@ -66,12 +64,10 @@ struct Cli {
     start_vector: Option<PathBuf>,
 
     /// Параметр матрицы (1)
-    /// См. [GrcarOperator]
     #[arg(long, default_value_t = 3)]
     grcar_upper: usize,
 
     /// Параметр матрицы (2)
-    /// См. [ConvectionDiffusionOperator]
     #[arg(long, default_value_t = 100.0)]
     rho: f64,
 
@@ -139,7 +135,7 @@ fn run() -> Result<(), IramError> {
 
     memory::reset_peak();
     let solve_timer = Instant::now();
-    let mut report = solve(operator.as_ref(), start_vector, config, start_description)?; // Вход в алгоритм
+    let mut report = solve(operator.as_ref(), start_vector, config, start_description)?;
     report.elapsed_seconds = solve_timer.elapsed().as_secs_f64();
     fs::write(&cli.output, report.render_text())?;
 
@@ -181,18 +177,12 @@ fn build_start_vector(
     cli: &Cli,
     dimension: usize,
     rng: &mut StdRng,
-) -> Result<(Array1<f64>, String), IramError> {
+) -> Result<(Array1<Complex64>, String), IramError> {
     if let Some(path) = &cli.start_vector {
         let content = fs::read_to_string(path)?;
         let entries = content
             .split_whitespace()
-            .map(|entry| {
-                entry.parse::<f64>().map_err(|error| {
-                    IramError::Parse(format!(
-                        "cannot parse start-vector entry '{entry}': {error}"
-                    ))
-                })
-            })
+            .map(parse_complex_token)
             .collect::<Result<Vec<_>, _>>()?;
 
         if entries.len() != dimension {

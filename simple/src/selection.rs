@@ -28,45 +28,35 @@ pub fn select_ritz_values(
             shifts: Vec::new(),
         });
     }
-    // Составляем карту комплексно-сопряженных чисел Ритца
-    let pair_map = build_pair_map(values);
 
-    // Обьявляем порядок чисел в выбранной части спектра
     let order = ranking(values, target);
-
-    // Выбираем 
-    let base_wanted = base_selection(values, target, nev, &order);
-    let mut keep_flags = vec![false; values.len()];
-    for &index in &base_wanted {
-        keep_flags[index] = true;
-        if let Some(pair_index) = pair_map[index] {
-            keep_flags[pair_index] = true;
-        }
-    }
-    let retained_dimension = keep_flags.iter().filter(|&&flag| flag).count();
+    let retained_dimension = nev.min(values.len());
 
     if retained_dimension > max_keep {
         return Err(IramError::InvalidConfig(format!(
-            "the requested nev={} together with complex-conjugate preservation requires {} retained Ritz values; increase ncv",
-            nev, retained_dimension,
+            "the requested nev={} requires retaining {} Ritz values, but only {} are available",
+            nev, retained_dimension, max_keep,
         )));
     }
 
-    let mut wanted = Vec::with_capacity(retained_dimension);
-    let mut shifts = Vec::with_capacity(values.len().saturating_sub(retained_dimension));
+    let selected = base_selection(values, target, retained_dimension, &order);
+    let mut keep_flags = vec![false; values.len()];
+    selected.iter().for_each(|&index| keep_flags[index] = true);
 
-    for &index in &order {
-        if keep_flags[index] {
-            if wanted.len() < retained_dimension {
-                wanted.push(RitzEstimate {
-                    value: values[index].value,
-                    residual_estimate: values[index].residual_estimate,
-                });
-            }
-        } else {
-            shifts.push(values[index].value);
-        }
-    }
+    let wanted = selected
+        .iter()
+        .map(|&index| RitzEstimate {
+            value: values[index].value,
+            residual_estimate: values[index].residual_estimate,
+        })
+        .collect::<Vec<_>>();
+
+    let shifts = order
+        .iter()
+        .copied()
+        .filter(|&index| !keep_flags[index])
+        .map(|index| values[index].value)
+        .collect::<Vec<_>>();
 
     Ok(SelectionOutcome {
         wanted,
@@ -124,7 +114,7 @@ fn base_selection(
     }
 }
 
-/// Сортировка чисел Р
+/// Сортировка чисел Ритца
 fn ranking(values: &[RitzValue], target: SpectrumTarget) -> Vec<usize> {
     let mut indices = (0..values.len()).collect::<Vec<_>>();
 
@@ -218,44 +208,6 @@ fn sort_by_real(values: &[RitzValue]) -> Vec<usize> {
     indices
 }
 
-/// Собираем комплексносопряженные пары чисел Ритца в индекс -> индекс сопряженного
-fn build_pair_map(values: &[RitzValue]) -> Vec<Option<usize>> {
-    let tolerance = 1.0e-8;
-    let mut pair_map = vec![None; values.len()];
-    let mut used = vec![false; values.len()];
-
-    values.iter().enumerate().for_each(|(index, entry)| {
-        if used[index] || entry.value.im <= tolerance {
-            return;
-        }
-
-        let conjugate = entry.value.conj();
-        let candidate = values
-            .iter()
-            .enumerate()
-            .filter(|(other_index, other_entry)| {
-                *other_index != index && !used[*other_index] && other_entry.value.im < -tolerance
-            })
-            .min_by(|(_, left_entry), (_, right_entry)| {
-                (left_entry.value - conjugate)
-                    .norm()
-                    .total_cmp(&(right_entry.value - conjugate).norm())
-            });
-
-        if let Some((pair_index, pair_entry)) = candidate {
-            let scale = 1.0 + entry.value.norm().max(pair_entry.value.norm());
-            if (pair_entry.value - conjugate).norm() <= tolerance * scale {
-                pair_map[index] = Some(pair_index);
-                pair_map[pair_index] = Some(index);
-                used[index] = true;
-                used[pair_index] = true;
-            }
-        }
-    });
-
-    pair_map
-}
-
 #[cfg(test)]
 mod tests {
     use num_complex::Complex64;
@@ -266,7 +218,7 @@ mod tests {
     use super::select_ritz_values;
 
     #[test]
-    fn preserves_complex_conjugate_pairs() {
+    fn complex_selection_keeps_exactly_nev_values() {
         let values = vec![
             RitzValue {
                 value: Complex64::new(3.0, 0.0),
@@ -286,11 +238,11 @@ mod tests {
             },
         ];
 
-        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 3)
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4)
             .expect("selection should succeed");
 
-        assert_eq!(selection.retained_dimension, 3);
-        assert_eq!(selection.wanted.len(), 3);
-        assert_eq!(selection.shifts.len(), 1);
+        assert_eq!(selection.retained_dimension, 2);
+        assert_eq!(selection.wanted.len(), 2);
+        assert_eq!(selection.shifts.len(), 2);
     }
 }

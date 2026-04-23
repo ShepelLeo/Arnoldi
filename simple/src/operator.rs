@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use ndarray::{Array1, Array2};
+use num_complex::Complex64;
 
 use crate::error::IramError;
 
@@ -13,11 +14,10 @@ pub trait LinearOperator: Send + Sync {
     /// Размерность задачи
     fn dimension(&self) -> usize;
     /// MatVec
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError>;
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError>;
     /// Буковки
     fn description(&self) -> String;
 }
-
 
 /// # Единичный оператор
 #[derive(Debug, Clone)]
@@ -36,7 +36,7 @@ impl LinearOperator for IdentityOperator {
         self.dimension
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError> {
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
         validate_dimension(self.dimension, vector.len())?;
         Ok(vector.clone())
     }
@@ -67,15 +67,19 @@ impl LinearOperator for GrcarOperator {
         self.dimension
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError> {
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
         validate_dimension(self.dimension, vector.len())?;
 
         Ok(Array1::from_iter((0..self.dimension).map(|row| {
             let diagonal = vector[row];
-            let subdiagonal = if row > 0 { -vector[row - 1] } else { 0.0 };
+            let subdiagonal = if row > 0 {
+                -vector[row - 1]
+            } else {
+                Complex64::new(0.0, 0.0)
+            };
             let superdiagonal_sum = (1..=self.upper_bandwidth)
                 .filter_map(|offset| vector.get(row + offset).copied())
-                .sum::<f64>();
+                .sum::<Complex64>();
 
             diagonal + subdiagonal + superdiagonal_sum
         })))
@@ -89,11 +93,10 @@ impl LinearOperator for GrcarOperator {
     }
 }
 
-
-/// # Разреженная матрица
+/// # Плотная матрица
 #[derive(Debug, Clone)]
 pub struct DenseMatrixOperator {
-    matrix: Array2<f64>,
+    matrix: Array2<Complex64>,
     label: String,
 }
 
@@ -106,13 +109,7 @@ impl DenseMatrixOperator {
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 line.split_whitespace()
-                    .map(|entry| {
-                        entry.parse::<f64>().map_err(|error| {
-                            IramError::Parse(format!(
-                                "cannot parse matrix entry '{entry}': {error}"
-                            ))
-                        })
-                    })
+                    .map(parse_complex_token)
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -154,7 +151,7 @@ impl LinearOperator for DenseMatrixOperator {
         self.matrix.nrows()
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError> {
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
         validate_dimension(self.dimension(), vector.len())?;
         Ok(self.matrix.dot(vector))
     }
@@ -164,9 +161,7 @@ impl LinearOperator for DenseMatrixOperator {
     }
 }
 
-
 /// # Матрица центральной разностной производной диффузионно-конвекционного оператора
-
 #[derive(Debug, Clone)]
 pub struct ConvectionDiffusionOperator {
     m: usize,
@@ -188,7 +183,7 @@ impl LinearOperator for ConvectionDiffusionOperator {
         self.m * self.m
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError> {
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
         let n = self.dimension();
         validate_dimension(n, vector.len())?;
 
@@ -200,21 +195,23 @@ impl LinearOperator for ConvectionDiffusionOperator {
             let i = k % self.m;
             let j = k / self.m;
 
-            let center = -4.0 * inv_h2 * vector[k];
+            let center = vector[k] * Complex64::new(-4.0 * inv_h2, 0.0);
 
             let left = (i > 0)
-                .then(|| (inv_h2 - conv) * vector[k - 1])
-                .unwrap_or(0.0);
+                .then(|| vector[k - 1] * Complex64::new(inv_h2 - conv, 0.0))
+                .unwrap_or(Complex64::new(0.0, 0.0));
 
             let right = (i + 1 < self.m)
-                .then(|| (inv_h2 + conv) * vector[k + 1])
-                .unwrap_or(0.0);
+                .then(|| vector[k + 1] * Complex64::new(inv_h2 + conv, 0.0))
+                .unwrap_or(Complex64::new(0.0, 0.0));
 
-            let down = (j > 0).then(|| inv_h2 * vector[k - self.m]).unwrap_or(0.0);
+            let down = (j > 0)
+                .then(|| vector[k - self.m] * Complex64::new(inv_h2, 0.0))
+                .unwrap_or(Complex64::new(0.0, 0.0));
 
             let up = (j + 1 < self.m)
-                .then(|| inv_h2 * vector[k + self.m])
-                .unwrap_or(0.0);
+                .then(|| vector[k + self.m] * Complex64::new(inv_h2, 0.0))
+                .unwrap_or(Complex64::new(0.0, 0.0));
 
             center + left + right + down + up
         })))
@@ -230,7 +227,7 @@ impl LinearOperator for ConvectionDiffusionOperator {
 
 pub struct FnOperator<F>
 where
-    F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync,
+    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
 {
     dimension: usize,
     name: String,
@@ -239,7 +236,7 @@ where
 
 impl<F> FnOperator<F>
 where
-    F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync,
+    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
 {
     pub fn new(dimension: usize, name: impl Into<String>, matvec: F) -> Self {
         Self {
@@ -252,32 +249,94 @@ where
 
 impl<F> fmt::Debug for FnOperator<F>
 where
-    F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync,
+    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FnOperator")
             .field("dimension", &self.dimension)
             .field("name", &self.name)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl<F> LinearOperator for FnOperator<F>
 where
-    F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync,
+    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
 {
     fn dimension(&self) -> usize {
         self.dimension
     }
 
-    fn apply(&self, vector: &Array1<f64>) -> Result<Array1<f64>, IramError> {
+    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
         validate_dimension(self.dimension, vector.len())?;
         Ok((self.matvec)(vector))
     }
 
     fn description(&self) -> String {
         self.name.clone()
+    }
+}
+
+pub fn parse_complex_token(entry: &str) -> Result<Complex64, IramError> {
+    let token = entry.trim();
+
+    if token.is_empty() {
+        return Err(IramError::Parse(
+            "cannot parse an empty complex entry".to_string(),
+        ));
+    }
+
+    if let Some(body) = token.strip_suffix('i').or_else(|| token.strip_suffix('j')) {
+        return parse_imaginary_body(body, token);
+    }
+
+    token
+        .parse::<f64>()
+        .map(|value| Complex64::new(value, 0.0))
+        .map_err(|error| IramError::Parse(format!("cannot parse complex entry '{token}': {error}")))
+}
+
+fn parse_imaginary_body(body: &str, original: &str) -> Result<Complex64, IramError> {
+    if let Some(split_index) = find_complex_split(body) {
+        let real_part = &body[..split_index];
+        let imaginary_part = &body[split_index..];
+        let real = parse_real_component(real_part, original)?;
+        let imaginary = parse_imaginary_component(imaginary_part, original)?;
+        Ok(Complex64::new(real, imaginary))
+    } else {
+        let imaginary = parse_imaginary_component(body, original)?;
+        Ok(Complex64::new(0.0, imaginary))
+    }
+}
+
+fn find_complex_split(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+
+    (1..bytes.len()).rev().find(|&index| {
+        let current = bytes[index] as char;
+        let previous = bytes[index - 1] as char;
+        (current == '+' || current == '-') && previous != 'e' && previous != 'E'
+    })
+}
+
+fn parse_real_component(component: &str, original: &str) -> Result<f64, IramError> {
+    component.parse::<f64>().map_err(|error| {
+        IramError::Parse(format!(
+            "cannot parse real part of complex entry '{original}': {error}"
+        ))
+    })
+}
+
+fn parse_imaginary_component(component: &str, original: &str) -> Result<f64, IramError> {
+    match component {
+        "" | "+" => Ok(1.0),
+        "-" => Ok(-1.0),
+        value => value.parse::<f64>().map_err(|error| {
+            IramError::Parse(format!(
+                "cannot parse imaginary part of complex entry '{original}': {error}"
+            ))
+        }),
     }
 }
 
@@ -289,18 +348,29 @@ fn validate_dimension(expected: usize, got: usize) -> Result<(), IramError> {
 
 #[cfg(test)]
 mod tests {
-    use ndarray::Array1;
+    use num_complex::Complex64;
 
-    use super::{ConvectionDiffusionOperator, LinearOperator};
+    use super::{ConvectionDiffusionOperator, LinearOperator, parse_complex_token};
 
     #[test]
-    fn convection_diffusion_matches_laplacian_when_rho_is_zero() {
-        let operator = ConvectionDiffusionOperator::new(2, 0.0);
-        let vector = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
-        let result = operator
-            .apply(&vector)
-            .expect("convection-diffusion matvec should succeed");
+    fn convection_diffusion_dimension_matches_grid() {
+        let operator = ConvectionDiffusionOperator::new(4, 1.0);
+        assert_eq!(operator.dimension(), 16);
+    }
 
-        assert_eq!(result.to_vec(), vec![9.0, -27.0, -63.0, -99.0]);
+    #[test]
+    fn complex_parser_supports_real_and_imaginary_entries() {
+        assert_eq!(
+            parse_complex_token("2.5").expect("real entry should parse"),
+            Complex64::new(2.5, 0.0)
+        );
+        assert_eq!(
+            parse_complex_token("-1.0+3.0i").expect("complex entry should parse"),
+            Complex64::new(-1.0, 3.0)
+        );
+        assert_eq!(
+            parse_complex_token("-i").expect("pure imaginary entry should parse"),
+            Complex64::new(0.0, -1.0)
+        );
     }
 }

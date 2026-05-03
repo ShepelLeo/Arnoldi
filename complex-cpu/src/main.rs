@@ -6,18 +6,18 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
+use complex_cpu::config::{SolverConfig, SpectrumTarget, recommended_ncv};
+use complex_cpu::linalg::ops::{normalize, normalized_random_vector};
+use complex_cpu::memory;
+use complex_cpu::operator::{
+    ConvectionDiffusionOperator, GrcarOperator, IdentityOperator, LinearOperator,
+    matrix_operator_from_text_file, parse_complex_token,
+};
+use complex_cpu::{IramError, solve};
 use ndarray::Array1;
 use num_complex::Complex64;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use simple::config::{SolverConfig, SpectrumTarget, recommended_ncv};
-use simple::linalg::ops::{normalize, normalized_random_vector};
-use simple::memory;
-use simple::operator::{
-    ConvectionDiffusionOperator, DenseMatrixOperator, GrcarOperator, IdentityOperator,
-    LinearOperator, parse_complex_token,
-};
-use simple::{IramError, solve};
 
 /// CLI
 #[derive(Debug, Parser)]
@@ -159,8 +159,7 @@ fn run() -> Result<(), IramError> {
 
 fn build_operator(cli: &Cli) -> Result<Box<dyn LinearOperator>, IramError> {
     if let Some(matrix_file) = &cli.matrix_file {
-        return DenseMatrixOperator::from_text_file(matrix_file)
-            .map(|operator| Box::new(operator) as Box<dyn LinearOperator>);
+        return matrix_operator_from_text_file(matrix_file);
     }
 
     match cli.operator {

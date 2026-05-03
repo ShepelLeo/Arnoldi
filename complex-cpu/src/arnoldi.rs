@@ -1,15 +1,15 @@
 //! Процесс Арнольди
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, ShapeBuilder, s};
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::ops::{is_numerical_breakdown, norm2, normalize, orthogonalize_twice};
+use crate::linalg::ops::{is_numerical_breakdown, norm2, normalize, orthogonalize2_twice};
 use crate::operator::LinearOperator;
 
 /// Ответ процесса
 #[derive(Debug, Clone)]
 pub struct ArnoldiFactorization {
-    pub basis: Vec<Array1<Complex64>>,
+    pub basis: Array2<Complex64>,
     pub hessenberg: Array2<Complex64>,
     pub performed_steps: usize,
     pub happy_breakdown: bool,
@@ -42,8 +42,9 @@ pub fn run_arnoldi(
     let mut normalized_start = start_vector.clone();
     normalize(&mut normalized_start, "Arnoldi start vector")?;
 
-    let basis = vec![normalized_start];
-    let hessenberg = Array2::<Complex64>::from_elem((steps + 1, steps), Complex64::new(0.0, 0.0));
+    let mut basis = Array2::zeros((operator.dimension(), steps + 1).f());
+    basis.column_mut(0).assign(&normalized_start);
+    let hessenberg = Array2::zeros((steps + 1, steps));
 
     continue_arnoldi(
         operator,
@@ -59,7 +60,7 @@ pub fn run_arnoldi(
 /// Вход в процесс Арнольди, второй и последующие прогоны, пополняем пространство Крыллова
 pub fn continue_arnoldi(
     operator: &dyn LinearOperator,
-    mut basis: Vec<Array1<Complex64>>,
+    mut basis: Array2<Complex64>,
     mut hessenberg: Array2<Complex64>,
     start_step: usize,
     target_steps: usize,
@@ -76,31 +77,35 @@ pub fn continue_arnoldi(
         )));
     }
 
-    if basis.len() < start_step + 1 {
+    if basis.ncols() < target_steps + 1 {
         return Err(IramError::InvalidConfig(format!(
             "Arnoldi continuation needs at least {} basis vectors, got {}",
-            start_step + 1,
-            basis.len(),
+            target_steps + 1,
+            basis.ncols(),
         )));
     }
 
     let mut performed_steps = start_step;
     let mut happy_breakdown = false;
 
+    let mut h_column = vec![Complex64::default(); target_steps];
+    let mut candidate = Array1::zeros(operator.dimension());
+
     for step in start_step..target_steps {
-        let current_vector = basis[step].clone();
-        let mut candidate = operator.apply(&current_vector)?;
+        operator.apply_into(basis.column(step), candidate.view_mut())?;
         let candidate_old = norm2(&candidate);
         *matvec_count += 1;
 
-        let mut h_column = vec![Complex64::new(0.0, 0.0); step + 1];
-        orthogonalize_twice(&mut candidate, &basis[..=step], &mut h_column);
+        h_column[..=step].fill(Complex64::ZERO);
+        orthogonalize2_twice(
+            &mut candidate,
+            &basis.slice(s![.., 0..=step]),
+            &mut h_column[..=step],
+        );
 
-        h_column
-            .iter()
-            .enumerate()
-            .for_each(|(row, &value)| hessenberg[[row, step]] = value);
-
+        for row in 0..=step {
+            hessenberg[[row, step]] = h_column[row];
+        }
         let candidate_norm = norm2(&candidate);
         performed_steps = step + 1;
 
@@ -114,7 +119,7 @@ pub fn continue_arnoldi(
         candidate
             .iter_mut()
             .for_each(|entry| *entry /= candidate_norm);
-        basis.push(candidate);
+        basis.column_mut(step + 1).assign(&candidate);
     }
 
     Ok(ArnoldiFactorization {

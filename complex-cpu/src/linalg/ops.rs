@@ -1,10 +1,11 @@
 //! Операции
 
-use ndarray::{Array1, Zip};
+use ndarray::{Array1, ArrayView2, Zip};
 use num_complex::Complex64;
 use rand::{Rng, RngExt};
 
 use crate::error::IramError;
+use crate::linalg::lapack::{ZgemvTranspose, zgemv};
 
 /// Нормализация вектора
 pub fn normalize(vector: &mut Array1<Complex64>, context: &'static str) -> Result<f64, IramError> {
@@ -63,11 +64,12 @@ pub fn linear_combination3(
     third: &Array1<Complex64>,
     third_alpha: Complex64,
 ) -> Array1<Complex64> {
-    Array1::from_iter(first.iter().zip(second.iter()).zip(third.iter()).map(
-        |((&first_entry, &second_entry), &third_entry)| {
-            first_alpha * first_entry + second_alpha * second_entry + third_alpha * third_entry
-        },
-    ))
+    first_alpha * first + second_alpha * second + third_alpha * third
+    // Array1::from_iter(first.iter().zip(second.iter()).zip(third.iter()).map(
+    //     |((&first_entry, &second_entry), &third_entry)| {
+    //         first_alpha * first_entry + second_alpha * second_entry + third_alpha * third_entry
+    //     },
+    // ))
 }
 
 /// Ортогонализация вектора по базису
@@ -83,6 +85,83 @@ pub fn orthogonalize_twice(
             axpy_in_place(candidate, -projection, basis_vector);
         });
     });
+}
+
+// pub fn orthogonalize2_twice(
+//     candidate: &mut Array1<Complex64>,
+//     basis: &ArrayView2<Complex64>,
+//     h_column: &mut [Complex64],
+// ) {
+//     for _ in 0..2 {
+//         let projection = basis
+//             .t()
+//             .mapv(|z| z.conj())
+//             .dot(candidate);
+
+//         for (h, p) in h_column.iter_mut().zip(projection.iter()) {
+//                 *h += *p;
+//             }
+
+//         *candidate -= &basis.dot(&projection);
+//     }
+// }
+
+// pub fn orthogonalize2_twice(
+//     candidate: &mut Array1<Complex64>,
+//     basis: &ArrayView2<Complex64>,
+//     h_column: &mut [Complex64],
+// ) {
+//     for _ in 0..2 {
+//         for (i, basis_col) in basis.axis_iter(Axis(1)).enumerate() {
+//             let proj = Zip::from(&basis_col)
+//                 .and(&*candidate)
+//                 .fold(Complex64::ZERO, |acc, &b, &c| acc + b.conj() * c);
+
+//             h_column[i] += proj;
+//             Zip::from(&mut *candidate)
+//                 .and(&basis_col)
+//                 .for_each(|c, &b| *c -= proj * b);
+//         }
+//     }
+// }
+
+pub fn orthogonalize2_twice(
+    candidate: &mut Array1<Complex64>,
+    basis: &ArrayView2<Complex64>,
+    h_column: &mut [Complex64],
+) {
+    let (m, n) = basis.dim();
+    assert_eq!(candidate.len(), m);
+    assert!(h_column.len() >= n);
+
+    let one = Complex64::new(1.0, 0.0);
+    let zero = Complex64::new(0.0, 0.0);
+    let minus_one = Complex64::new(-1.0, 0.0);
+
+    let x = candidate
+        .as_slice_mut()
+        .expect("candidate must be contiguous");
+
+    let mut projection = vec![Complex64::ZERO; n];
+
+    for _ in 0..2 {
+        projection.fill(Complex64::ZERO);
+
+        zgemv(
+            ZgemvTranspose::ConjugateTranspose,
+            *basis,
+            one,
+            x,
+            zero,
+            &mut projection,
+        );
+
+        for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
+            *h += p;
+        }
+
+        zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
+    }
 }
 
 /// Генерация нормализованного случайного вектора

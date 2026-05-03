@@ -1,0 +1,43 @@
+# Rust build artifacts в любой директории
+target/
+
+# Rust backup files
+*.rs.bk
+
+# Cargo lock
+# Для binary/application обычно коммитят Cargo.lock.
+# Для library/crate можно игнорировать:
+# Cargo.lock
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Coverage
+coverage/
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Profiling
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Temp
+tmp/
+temp/

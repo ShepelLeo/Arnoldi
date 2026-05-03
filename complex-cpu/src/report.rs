@@ -15,7 +15,6 @@ pub struct RitzEstimate {
 pub struct IterationLog {
     pub restart: usize,
     pub krylov_dimension: usize,
-    pub retained_dimension: usize,
     pub converged: usize,
     pub total_matvecs: usize,
     pub peak_memory_bytes: usize,
@@ -128,10 +127,9 @@ impl SolveReport {
         self.history.iter().for_each(|log| {
             writeln!(
                 &mut output,
-                "restart {:>2}: krylov_dim={}, kept_dim={}, converged={}, matvecs={}, peak_memory={} bytes, happy_breakdown={}",
+                "restart {:>2}: krylov_dim={}, converged={}, matvecs={}, peak_memory={} bytes, happy_breakdown={}",
                 log.restart,
                 log.krylov_dimension,
-                log.retained_dimension,
                 log.converged,
                 log.total_matvecs,
                 log.peak_memory_bytes,

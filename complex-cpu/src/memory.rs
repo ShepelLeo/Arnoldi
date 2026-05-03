@@ -8,11 +8,15 @@ static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 static BASELINE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn update_peak(next_value: usize) {
-    let mut peak = PEAK_BYTES.load(Ordering::SeqCst);
+    let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
 
     while next_value > peak {
-        match PEAK_BYTES.compare_exchange_weak(peak, next_value, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        match PEAK_BYTES.compare_exchange_weak(
+            peak,
+            next_value,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => break,
             Err(observed) => peak = observed,
         }
@@ -24,7 +28,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         let pointer = unsafe { System.alloc(layout) };
 
         if !pointer.is_null() {
-            let next = CURRENT_BYTES.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+            let next = CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             update_peak(next);
         }
 
@@ -35,7 +39,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         let pointer = unsafe { System.alloc_zeroed(layout) };
 
         if !pointer.is_null() {
-            let next = CURRENT_BYTES.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+            let next = CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             update_peak(next);
         }
 
@@ -44,7 +48,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         unsafe { System.dealloc(pointer, layout) };
-        CURRENT_BYTES.fetch_sub(layout.size(), Ordering::SeqCst);
+        CURRENT_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -53,10 +57,10 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         if !new_pointer.is_null() {
             if new_size >= layout.size() {
                 let delta = new_size - layout.size();
-                let next = CURRENT_BYTES.fetch_add(delta, Ordering::SeqCst) + delta;
+                let next = CURRENT_BYTES.fetch_add(delta, Ordering::Relaxed) + delta;
                 update_peak(next);
             } else {
-                CURRENT_BYTES.fetch_sub(layout.size() - new_size, Ordering::SeqCst);
+                CURRENT_BYTES.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
             }
         }
 
@@ -65,13 +69,13 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 }
 
 pub fn reset_peak() {
-    let current = CURRENT_BYTES.load(Ordering::SeqCst);
-    BASELINE_BYTES.store(current, Ordering::SeqCst);
-    PEAK_BYTES.store(current, Ordering::SeqCst);
+    let current = CURRENT_BYTES.load(Ordering::Relaxed);
+    BASELINE_BYTES.store(current, Ordering::Relaxed);
+    PEAK_BYTES.store(current, Ordering::Relaxed);
 }
 
 pub fn peak_bytes_since_reset() -> usize {
     PEAK_BYTES
-        .load(Ordering::SeqCst)
-        .saturating_sub(BASELINE_BYTES.load(Ordering::SeqCst))
+        .load(Ordering::Relaxed)
+        .saturating_sub(BASELINE_BYTES.load(Ordering::Relaxed))
 }

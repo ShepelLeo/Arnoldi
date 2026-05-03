@@ -16,6 +16,6 @@ pub use error::IramError;
 pub use iram::solve;
 pub use operator::{
     ConvectionDiffusionOperator, DenseMatrixOperator, FnOperator, GrcarOperator, IdentityOperator,
-    LinearOperator, parse_complex_token,
+    LinearOperator, MatrixMarketOperator, matrix_operator_from_text_file, parse_complex_token,
 };
 pub use report::{IterationLog, RitzEstimate, SolveReport};

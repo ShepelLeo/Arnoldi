@@ -1,20 +1,18 @@
 //! Ход IRAM
 //! Процесс Арнольди, рестарты
-use nalgebra::DMatrix;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder, s};
 use num_complex::Complex64;
 
 use crate::arnoldi::{ArnoldiFactorization, continue_arnoldi, run_arnoldi};
 use crate::config::SolverConfig;
 use crate::error::IramError;
-use crate::linalg::ops::{
-    axpy_in_place, is_numerical_breakdown, norm2, normalize, orthogonalize_twice, scale_in_place,
-};
-use crate::linalg::small::compute_ritz_values;
+use crate::linalg::lapack::*;
+use crate::linalg::ops::{is_numerical_breakdown, norm2, normalize, orthogonalize2_twice};
+use crate::linalg::small::{compute_ritz_values, retrive_ritz_vectors};
 use crate::memory;
 use crate::operator::LinearOperator;
-use crate::report::{IterationLog, SolveReport};
-use crate::selection::select_ritz_values;
+use crate::report::{IterationLog, RitzEstimate, SolveReport};
+use crate::selection::*;
 
 /// Вход в алгоритм
 pub fn solve(
@@ -25,10 +23,12 @@ pub fn solve(
 ) -> Result<SolveReport, IramError> {
     config.validate(operator.dimension())?;
 
+    // Инициализируем стартовый вектор
     let mut current_start = start_vector;
     normalize(&mut current_start, "solver start vector")?;
 
     let mut total_matvecs = 0usize;
+    // Запуск процесса Арнольди
     let mut factorization = run_arnoldi(
         operator,
         &current_start,
@@ -43,69 +43,95 @@ pub fn solve(
     let mut happy_breakdown = false;
     let mut converged = 0usize;
 
+    // Рестарты
     for restart in 0..=config.max_restarts {
-        let krylov_dimension = factorization.performed_steps;
+        let krylov_dim = factorization.performed_steps;
         let square_hessenberg = factorization.square_hessenberg();
+        // Крайний поддиагональный элемент
         let trailing_subdiagonal = factorization.trailing_subdiagonal();
 
-        let ritz_values = compute_ritz_values(&square_hessenberg, trailing_subdiagonal)?;
-        let keep_limit = krylov_dimension;
-        let selection = select_ritz_values(&ritz_values, config.target, config.nev, keep_limit)?;
+        // Малая спектральная задача
+        let mut hessenberg_schur = compute_ritz_values(&square_hessenberg);
 
-        converged = selection
+        // Выбираем желаемые СЗН матрицы Хессенберга
+        let selection =
+            select_ritz_values(&hessenberg_schur.w, config.target, config.nev, krylov_dim)?;
+
+        let ritz_vectors =
+            retrive_ritz_vectors(&mut hessenberg_schur, &selection.wanted, krylov_dim);
+
+        let result: Vec<RitzEstimate> = selection
             .wanted
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| {
+                let value = hessenberg_schur.w[idx];
+
+                let residual_estimate =
+                    (trailing_subdiagonal * ritz_vectors[[krylov_dim - 1, i]]).norm();
+
+                RitzEstimate {
+                    value,
+                    residual_estimate,
+                }
+            })
+            .collect();
+
+        // Сколько сошлось
+        converged = result
             .iter()
             .filter(|estimate| estimate.residual_estimate <= config.tol)
             .count();
-        final_values = selection.wanted.clone();
         happy_breakdown = factorization.happy_breakdown;
+
+        final_values = result;
 
         history.push(IterationLog {
             restart,
-            krylov_dimension,
-            retained_dimension: selection.retained_dimension,
+            krylov_dimension: krylov_dim,
             converged,
             total_matvecs,
             peak_memory_bytes: memory::peak_bytes_since_reset(),
             happy_breakdown,
-            wanted: selection.wanted.clone(),
+            wanted: final_values.clone(),
             shifts: selection.shifts.clone(),
         });
 
         if converged >= config.nev {
             fully_converged = true;
-            break;
+            break; // Ура, мы сошлись
         }
 
         if factorization.happy_breakdown {
-            note = Some(if krylov_dimension < config.nev {
-                "happy breakdown occurred before the Krylov space became large enough; with the current start vector the chosen operator does not expose enough independent eigen-directions"
+            note = Some(if krylov_dim < config.nev {
+                "happy breakdown occurred before the Krylov space became large enough; with a single starting vector the chosen operator cannot expose that many independent eigen-directions"
                     .to_string()
             } else {
                 "happy breakdown detected; the current Krylov subspace is already invariant"
                     .to_string()
             });
-            break;
+            break; // Беда
         }
 
         if restart == config.max_restarts {
             note = Some("maximum number of restarts reached before full convergence".to_string());
-            break;
+            break; // Недобили
         }
 
         if selection.shifts.is_empty() {
             note = Some("no unwanted Ritz values remain for the restart filter".to_string());
-            break;
+            break; // Беда
         }
 
+        // Запускаем рестарты
         factorization = implicit_restart_and_extend(
             operator,
             &factorization,
-            selection.retained_dimension,
             &selection.shifts,
-            config.ncv,
+            config.ncv + converged,
             config.breakdown_tol,
             &mut total_matvecs,
+            selection.wanted.len(),
         )?;
     }
 
@@ -131,14 +157,13 @@ pub fn solve(
 fn implicit_restart_and_extend(
     operator: &dyn LinearOperator,
     factorization: &ArnoldiFactorization,
-    retained_dimension: usize,
     shifts: &[Complex64],
     target_steps: usize,
     breakdown_tol: f64,
     matvec_count: &mut usize,
+    k: usize,
 ) -> Result<ArnoldiFactorization, IramError> {
     let m = factorization.performed_steps;
-    let k = retained_dimension;
 
     if k == 0 || k >= m {
         return Err(IramError::InvalidConfig(format!(
@@ -146,7 +171,7 @@ fn implicit_restart_and_extend(
         )));
     }
 
-    if factorization.basis.len() < m + 1 {
+    if factorization.basis.ncols() < m + 1 {
         return Err(IramError::InvalidConfig(
             "implicit restart requires the trailing Arnoldi residual vector".to_string(),
         ));
@@ -154,33 +179,36 @@ fn implicit_restart_and_extend(
 
     // A V_m = V_m H_m + beta v_{m+1} e_m^T
     let beta = factorization.trailing_subdiagonal();
-    let old_hessenberg = factorization.square_hessenberg();
-    let mut h = array_to_dmatrix(&old_hessenberg);
-    let mut q_total = DMatrix::<Complex64>::identity(m, m);
+    let (rotation, h) = zlaqr52(&mut factorization.square_hessenberg(), shifts).unwrap();
 
-    apply_shifted_qr_steps(&mut h, &mut q_total, shifts);
-
-    let rotated_basis = (0..k)
-        .map(|column| rotate_basis_column(&factorization.basis[..m], &q_total, column))
-        .collect::<Vec<_>>();
+    let rotated_basis = rotate_basis(&factorization.basis.slice(s![.., ..m]), &rotation, k);
     let mut restarted_hessenberg =
-        Array2::<Complex64>::from_elem((target_steps + 1, target_steps), Complex64::new(0.0, 0.0));
+        Array2::<Complex64>::from_elem((target_steps + 1, target_steps), Complex64::ZERO);
 
     (0..k).for_each(|column| {
         (0..k).for_each(|row| {
-            restarted_hessenberg[[row, column]] = h[(row, column)];
+            restarted_hessenberg[[row, column]] = h[[row, column]];
         });
     });
 
     // r_new = h_{k+1,k} * (V_m q_{k+1}) + beta * q_{m,k} * v_{m+1}
     let h_coupling = h[(k, k - 1)];
-    let residual_coupling = Complex64::new(beta, 0.0) * q_total[(m - 1, k - 1)];
-    let mut residual = rotate_basis_column(&factorization.basis[..m], &q_total, k);
-    scale_in_place(&mut residual, h_coupling);
-    axpy_in_place(&mut residual, residual_coupling, &factorization.basis[m]);
+    let residual_coupling = Complex64::new(beta, 0.0) * rotation[[m - 1, k - 1]];
 
-    let mut h_column_correction = vec![Complex64::new(0.0, 0.0); k];
-    orthogonalize_twice(&mut residual, &rotated_basis, &mut h_column_correction);
+    let mut residual = factorization
+        .basis
+        .slice(s![.., ..m])
+        .dot(&rotation.column(k));
+
+    residual *= h_coupling;
+    residual.scaled_add(residual_coupling, &factorization.basis.column(m));
+
+    let mut h_column_correction = vec![Complex64::default(); k];
+    orthogonalize2_twice(
+        &mut residual,
+        &rotated_basis.view(),
+        &mut h_column_correction,
+    );
     h_column_correction
         .iter()
         .enumerate()
@@ -189,7 +217,7 @@ fn implicit_restart_and_extend(
     let residual_norm = norm2(&residual);
     let residual_reference_norm = (h_coupling.norm_sqr() + residual_coupling.norm_sqr()).sqrt();
     if is_numerical_breakdown(residual_norm, residual_reference_norm, breakdown_tol) {
-        restarted_hessenberg[[k, k - 1]] = Complex64::new(0.0, 0.0);
+        restarted_hessenberg[[k, k - 1]] = Complex64::ZERO;
         return Ok(ArnoldiFactorization {
             basis: rotated_basis,
             hessenberg: restarted_hessenberg,
@@ -203,12 +231,16 @@ fn implicit_restart_and_extend(
         .iter_mut()
         .for_each(|entry| *entry /= residual_norm);
 
-    let mut basis = rotated_basis;
-    basis.push(residual);
+    let mut continued_basis =
+        Array2::<Complex64>::zeros((factorization.basis.nrows(), target_steps + 1).f());
+    continued_basis
+        .slice_mut(s![.., 0..k])
+        .assign(&rotated_basis);
+    continued_basis.column_mut(k).assign(&residual);
 
     continue_arnoldi(
         operator,
-        basis,
+        continued_basis,
         restarted_hessenberg,
         k,
         target_steps,
@@ -217,69 +249,15 @@ fn implicit_restart_and_extend(
     )
 }
 
-/// Вход в QR-shifted
-fn apply_shifted_qr_steps(
-    h: &mut DMatrix<Complex64>,
-    q_total: &mut DMatrix<Complex64>,
-    shifts: &[Complex64],
-) {
-    shifts
-        .iter()
-        .copied()
-        .for_each(|shift| apply_shifted_qr_step(h, q_total, shift));
-}
-
-/// Комплексный сдвиг
-fn apply_shifted_qr_step(
-    h: &mut DMatrix<Complex64>,
-    q_total: &mut DMatrix<Complex64>,
-    shift: Complex64,
-) {
-    let order = h.nrows();
-    let identity = DMatrix::<Complex64>::identity(order, order);
-    let shifted = h.clone() - identity.clone() * shift;
-    let (q, r) = shifted.qr().unpack();
-
-    *h = r * q.clone() + identity * shift;
-    *q_total = q_total.clone() * q;
-    enforce_upper_hessenberg(h);
-}
-
-/// Грубо сохраняем Хессенберговость
-fn enforce_upper_hessenberg(h: &mut DMatrix<Complex64>) {
-    let order = h.nrows();
-
-    (0..order).for_each(|row| {
-        (0..row.saturating_sub(1)).for_each(|column| {
-            if h[(row, column)].norm() <= 1.0e-10 {
-                h[(row, column)] = Complex64::new(0.0, 0.0);
-            }
-        });
-    });
-}
-
-/// Поворот базиса
-fn rotate_basis_column(
-    basis: &[Array1<Complex64>],
-    q_total: &DMatrix<Complex64>,
+fn rotate_basis(
+    basis: &ArrayView2<Complex64>,
+    q_total: &Array2<Complex64>,
     column: usize,
-) -> Array1<Complex64> {
-    let mut result = Array1::<Complex64>::from_elem(basis[0].len(), Complex64::new(0.0, 0.0));
-
-    basis.iter().enumerate().for_each(|(row, basis_vector)| {
-        let coefficient = q_total[(row, column)];
-        if coefficient.norm() > 0.0 {
-            axpy_in_place(&mut result, coefficient, basis_vector);
-        }
-    });
-
+) -> Array2<Complex64> {
+    let product = basis.dot(&q_total.slice(s![.., 0..column]));
+    let mut result = Array2::zeros((product.nrows(), product.ncols()).f());
+    result.assign(&product);
     result
-}
-
-/// Переводим ndarray матрицу в nalgebra, нужно чтобы достать QR
-fn array_to_dmatrix(array: &Array2<Complex64>) -> DMatrix<Complex64> {
-    let storage = array.iter().copied().collect::<Vec<_>>();
-    DMatrix::from_row_slice(array.nrows(), array.ncols(), &storage)
 }
 
 #[cfg(test)]
@@ -300,13 +278,13 @@ mod tests {
         let operator = IdentityOperator::new(8);
         let start = Array1::from_vec(vec![
             Complex64::new(1.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
+            Complex64::ZERO,
+            Complex64::ZERO,
+            Complex64::ZERO,
+            Complex64::ZERO,
+            Complex64::ZERO,
+            Complex64::ZERO,
+            Complex64::ZERO,
         ]);
         let config = SolverConfig {
             nev: 1,

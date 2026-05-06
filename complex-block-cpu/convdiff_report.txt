@@ -1,0 +1,62 @@
+IRAM convergence report
+=======================
+operator: Matrix Market matrix loaded from matrices/rw5151.mtx
+dimension: 5151
+start vector: random orthonormal block 5151x4 with seed 0
+target: largest magnitude
+requested eigenvalues: 4
+block size: 4
+Arnoldi block iterations (ncv): 100
+tolerance: 1.000e-16
+Ritz selection inflation: 1.000e0
+max restarts: 1000
+
+summary
+-------
+converged eigenvalues: 4 / 4
+elapsed wall-clock time: 9.851186 s
+restart cycles: 6
+matvec operations: 3667
+peak tracked heap memory: 300224400 bytes (286.316 MiB)
+happy breakdown: no
+fully converged: yes
+
+final Ritz values
+-----------------
+ 1. lambda =         1.000000000000e0 | residual estimate = 4.506e-26
+ 2. lambda = 9.759657299717e-1 +9.976510441968e-3i | residual estimate = 1.871e-27
+ 3. lambda = 9.759657299694e-1 -9.976510439290e-3i | residual estimate = 9.449e-24
+ 4. lambda = 9.725569701401e-1 +7.805070845676e-12i | residual estimate = 1.199e-23
+
+history
+-------
+restart  0: krylov_dim=400, converged=0, matvecs=400, peak_memory=72788064 bytes, happy_breakdown=no
+      wanted  1: lambda = 1.000275402439e0 +8.908480939110e-5i | residual estimate = 3.804e-3
+      wanted  2: lambda = 9.922489266763e-1 -3.178434961924e-3i | residual estimate = 8.229e-3
+      wanted  3: lambda = 9.911588831384e-1 +1.504957544166e-2i | residual estimate = 7.771e-3
+      wanted  4: lambda = 9.877658930794e-1 -1.585525479006e-2i | residual estimate = 7.975e-3
+restart  1: krylov_dim=402, converged=0, matvecs=796, peak_memory=144421456 bytes, happy_breakdown=no
+      wanted  1: lambda = 1.000000021036e0 +3.011757861999e-8i | residual estimate = 1.447e-7
+      wanted  2: lambda = 9.805276012160e-1 -6.242475626788e-3i | residual estimate = 3.160e-5
+      wanted  3: lambda = 9.791060681811e-1 -1.381636844105e-2i | residual estimate = 1.770e-5
+      wanted  4: lambda = 9.791053995676e-1 +1.142573229136e-2i | residual estimate = 3.849e-5
+restart  2: krylov_dim=601, converged=0, matvecs=1390, peak_memory=181519336 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 4.950e-15
+      wanted  2: lambda = 9.759658646309e-1 -9.976934974265e-3i | residual estimate = 4.994e-10
+      wanted  3: lambda = 9.759654427091e-1 +9.977022869710e-3i | residual estimate = 5.428e-10
+      wanted  4: lambda = 9.726024721520e-1 +9.462432392569e-6i | residual estimate = 9.540e-10
+restart  3: krylov_dim=700, converged=1, matvecs=2083, peak_memory=231794760 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 1.003e-19
+      wanted  2: lambda = 9.759657299720e-1 +9.976510421560e-3i | residual estimate = 2.391e-14
+      wanted  3: lambda = 9.759657299315e-1 -9.976510483789e-3i | residual estimate = 1.818e-14
+      wanted  4: lambda = 9.725569885098e-1 +1.519177644776e-8i | residual estimate = 1.831e-13
+restart  4: krylov_dim=600, converged=2, matvecs=2677, peak_memory=231794760 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 6.656e-19
+      wanted  2: lambda = 9.759657299724e-1 +9.976510442387e-3i | residual estimate = 1.402e-16
+      wanted  3: lambda = 9.759657299693e-1 -9.976510439227e-3i | residual estimate = 6.615e-17
+      wanted  4: lambda = 9.725569700697e-1 +2.454575806722e-10i | residual estimate = 2.627e-15
+restart  5: krylov_dim=1000, converged=4, matvecs=3667, peak_memory=300224400 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 4.506e-26
+      wanted  2: lambda = 9.759657299717e-1 +9.976510441968e-3i | residual estimate = 1.871e-27
+      wanted  3: lambda = 9.759657299694e-1 -9.976510439290e-3i | residual estimate = 9.449e-24
+      wanted  4: lambda = 9.725569701401e-1 +7.805070845676e-12i | residual estimate = 1.199e-23

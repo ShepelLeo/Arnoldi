@@ -8,7 +8,7 @@ use crate::error::IramError;
 #[derive(Debug, Clone)]
 pub struct SelectionOut {
     pub wanted: Vec<usize>,
-    pub shifts: Vec<Complex64>,
+    pub retained: Vec<usize>,
 }
 
 /// Вход в селектор
@@ -17,11 +17,12 @@ pub fn select_ritz_values(
     target: SpectrumTarget,
     nev: usize,
     max_keep: usize,
+    inflation: f64,
 ) -> Result<SelectionOut, IramError> {
     if values.is_empty() {
         return Ok(SelectionOut {
             wanted: Vec::new(),
-            shifts: Vec::new(),
+            retained: Vec::new(),
         });
     }
 
@@ -37,16 +38,41 @@ pub fn select_ritz_values(
 
     let wanted = base_selection(values, target, retained_dimension, &order);
     let mut keep_flags = vec![false; values.len()];
+    let mut retained = wanted.clone();
     wanted.iter().for_each(|&index| keep_flags[index] = true);
 
-    let shifts = order
-        .iter()
-        .copied()
-        .filter(|&index| !keep_flags[index])
-        .map(|index| values[index])
-        .collect::<Vec<_>>();
+    if !wanted.is_empty() && retained.len() < max_keep {
+        let center = ritz_center(values, &wanted);
+        let radius = wanted
+            .iter()
+            .map(|&index| (values[index] - center).norm())
+            .fold(0.0, f64::max);
+        let inflated_radius = inflation * radius;
+        let slack = 100.0 * f64::EPSILON * center.norm().max(inflated_radius).max(1.0);
 
-    Ok(SelectionOut { wanted, shifts })
+        for &index in &order {
+            if retained.len() == max_keep {
+                break;
+            }
+            if keep_flags[index] {
+                continue;
+            }
+            if (values[index] - center).norm() <= inflated_radius + slack {
+                retained.push(index);
+                keep_flags[index] = true;
+            }
+        }
+    }
+
+    Ok(SelectionOut { wanted, retained })
+}
+
+fn ritz_center(values: &[Complex64], indices: &[usize]) -> Complex64 {
+    let sum = indices
+        .iter()
+        .map(|&index| values[index])
+        .sum::<Complex64>();
+    sum / indices.len() as f64
 }
 
 fn base_selection(
@@ -192,10 +218,26 @@ mod tests {
             Complex64::new(-4.0, 0.0),
         ];
 
-        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4)
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, 1.0)
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted.len(), 2);
-        assert_eq!(selection.shifts.len(), 2);
+        assert_eq!(selection.retained.len(), 2);
+    }
+
+    #[test]
+    fn inflated_disk_keeps_extra_ritz_pairs_for_restart() {
+        let values = vec![
+            Complex64::new(5.0, 0.0),
+            Complex64::new(4.0, 0.0),
+            Complex64::new(3.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        ];
+
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, 3.0)
+            .expect("selection should succeed");
+
+        assert_eq!(selection.wanted, vec![0, 1]);
+        assert_eq!(selection.retained, vec![0, 1, 2]);
     }
 }

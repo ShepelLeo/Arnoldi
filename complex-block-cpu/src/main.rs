@@ -6,15 +6,15 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use complex_cpu::config::{SolverConfig, SpectrumTarget, recommended_ncv};
-use complex_cpu::linalg::ops::{normalize, normalized_random_vector};
-use complex_cpu::memory;
-use complex_cpu::operator::{
+use complex_block_cpu::config::{SolverConfig, SpectrumTarget};
+use complex_block_cpu::linalg::ops::{normalize, normalized_random_unitary_matrix};
+use complex_block_cpu::memory;
+use complex_block_cpu::operator::{
     ConvectionDiffusionOperator, GrcarOperator, IdentityOperator, LinearOperator,
     matrix_operator_from_text_file, parse_complex_token,
 };
-use complex_cpu::{IramError, solve};
-use ndarray::Array1;
+use complex_block_cpu::{IramError, solve_block};
+use ndarray::{Array1, Array2, Axis};
 use num_complex::Complex64;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -31,9 +31,13 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     nev: usize,
 
-    /// Размерность базиса Крылова
+    /// Размер стартового и последующих блочных пополнений; по умолчанию равен nev
     #[arg(long)]
-    ncv: Option<usize>,
+    block_size: Option<usize>,
+
+    /// Количество блочных итераций Arnoldi
+    #[arg(long)]
+    ncv: usize,
 
     /// Максимальное количество рестартов
     #[arg(long, default_value_t = 40)]
@@ -46,6 +50,10 @@ struct Cli {
     /// Стоп-значение невязки ортогонализации при пополнении базиса Крылова
     #[arg(long, default_value_t = 1.0e-12)]
     breakdown_tol: f64,
+
+    /// Расширение окружности для выбора Ritz-пар, удерживаемых на толстом рестарте
+    #[arg(long, default_value_t = 1.0)]
+    ritz_inflation: f64,
 
     /// Искомая часть спектра
     #[arg(long, value_enum, default_value_t = TargetArg::LargestMagnitude)]
@@ -119,23 +127,24 @@ fn main() {
 fn run() -> Result<(), IramError> {
     let cli = Cli::parse();
     let operator = build_operator(&cli)?;
+    let block_size = cli.block_size.unwrap_or(cli.nev);
     let mut rng = StdRng::seed_from_u64(cli.seed);
-    let (start_vector, start_description) =
-        build_start_vector(&cli, operator.dimension(), &mut rng)?;
+    let (start_block, start_description) =
+        build_start_block(&cli, block_size, operator.dimension(), &mut rng)?;
     let config = SolverConfig {
         nev: cli.nev,
-        ncv: cli
-            .ncv
-            .unwrap_or_else(|| recommended_ncv(cli.nev, operator.dimension())),
+        block_size,
+        ncv: cli.ncv,
         max_restarts: cli.max_restarts,
         tol: cli.tol,
         breakdown_tol: cli.breakdown_tol,
+        ritz_inflation: cli.ritz_inflation,
         target: cli.target.into(),
     };
 
     memory::reset_peak();
     let solve_timer = Instant::now();
-    let mut report = solve(operator.as_ref(), start_vector, config, start_description)?;
+    let mut report = solve_block(operator.as_ref(), start_block, config, start_description)?;
     report.elapsed_seconds = solve_timer.elapsed().as_secs_f64();
     fs::write(&cli.output, report.render_text())?;
 
@@ -172,12 +181,19 @@ fn build_operator(cli: &Cli) -> Result<Box<dyn LinearOperator>, IramError> {
     }
 }
 
-fn build_start_vector(
+fn build_start_block(
     cli: &Cli,
+    block_size: usize,
     dimension: usize,
     rng: &mut StdRng,
-) -> Result<(Array1<Complex64>, String), IramError> {
+) -> Result<(Array2<Complex64>, String), IramError> {
     if let Some(path) = &cli.start_vector {
+        if block_size != 1 {
+            return Err(IramError::InvalidConfig(
+                "--start-vector can only be used with --block-size 1".to_string(),
+            ));
+        }
+
         let content = fs::read_to_string(path)?;
         let entries = content
             .split_whitespace()
@@ -193,9 +209,17 @@ fn build_start_vector(
 
         let mut vector = Array1::from_vec(entries);
         normalize(&mut vector, "user-supplied start vector")?;
-        return Ok((vector, format!("loaded from {}", path.display())));
+        let block = vector.insert_axis(Axis(1));
+        return Ok((block, format!("loaded from {}", path.display())));
     }
 
-    normalized_random_vector(dimension, rng)
-        .map(|vector| (vector, format!("random vector with seed {}", cli.seed)))
+    normalized_random_unitary_matrix(dimension, block_size, rng).map(|block| {
+        (
+            block,
+            format!(
+                "random orthonormal block {}x{} with seed {}",
+                dimension, block_size, cli.seed
+            ),
+        )
+    })
 }

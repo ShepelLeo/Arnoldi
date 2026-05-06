@@ -4,10 +4,11 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder};
 use num_complex::Complex64;
 
 use crate::error::IramError;
+use crate::linalg::lapack::{ZgemmTranspose, ZgemvTranspose, zgemm_into, zgemv_into};
 
 /// Трейт линейных операторов
 pub trait LinearOperator: Send + Sync {
@@ -23,6 +24,27 @@ pub trait LinearOperator: Send + Sync {
         let mut output = Array1::zeros(self.dimension());
         self.apply_into(vector.view(), output.view_mut())?;
         Ok(output)
+    }
+    /// MatMat для блочного метода. Реализация по умолчанию применяет MatVec к столбцам.
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        validate_dimension(self.dimension(), block.nrows())?;
+        validate_dimension(self.dimension(), output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+
+        for column in 0..block.ncols() {
+            self.apply_into(block.column(column), output.column_mut(column))?;
+        }
+
+        Ok(())
     }
     /// Буковки
     fn description(&self) -> String;
@@ -53,6 +75,23 @@ impl LinearOperator for IdentityOperator {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
         output.assign(&vector);
+        Ok(())
+    }
+
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        validate_dimension(self.dimension, block.nrows())?;
+        validate_dimension(self.dimension, output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+        output.assign(&block);
         Ok(())
     }
 
@@ -108,6 +147,37 @@ impl LinearOperator for GrcarOperator {
         Ok(())
     }
 
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        validate_dimension(self.dimension, block.nrows())?;
+        validate_dimension(self.dimension, output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+
+        for row in 0..self.dimension {
+            let upper_end = (row + self.upper_bandwidth + 1).min(self.dimension);
+            for column in 0..block.ncols() {
+                let mut acc = block[[row, column]];
+                if row > 0 {
+                    acc -= block[[row - 1, column]];
+                }
+                for upper in (row + 1)..upper_end {
+                    acc += block[[upper, column]];
+                }
+                output[[row, column]] = acc;
+            }
+        }
+
+        Ok(())
+    }
+
     fn description(&self) -> String {
         format!(
             "Grcar operator of dimension {} with {} superdiagonals",
@@ -158,9 +228,12 @@ impl DenseMatrixOperator {
             )));
         }
 
-        let flat = rows.into_iter().flatten().collect::<Vec<_>>();
-        let matrix = Array2::from_shape_vec((dimension, width), flat)
-            .map_err(|error| IramError::Parse(format!("cannot reshape dense matrix: {error}")))?;
+        let mut matrix = Array2::zeros((dimension, width).f());
+        for (row_index, row) in rows.iter().enumerate() {
+            for (column_index, &value) in row.iter().enumerate() {
+                matrix[[row_index, column_index]] = value;
+            }
+        }
 
         Ok(Self {
             matrix,
@@ -621,7 +694,39 @@ impl LinearOperator for DenseMatrixOperator {
     ) -> Result<(), IramError> {
         validate_dimension(self.dimension(), vector.len())?;
         validate_dimension(self.dimension(), output.len())?;
-        output.assign(&self.matrix.dot(&vector));
+        zgemv_into(
+            ZgemvTranspose::None,
+            self.matrix.view(),
+            Complex64::new(1.0, 0.0),
+            vector,
+            Complex64::ZERO,
+            output.view_mut(),
+        );
+        Ok(())
+    }
+
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        validate_dimension(self.dimension(), block.nrows())?;
+        validate_dimension(self.dimension(), output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+        zgemm_into(
+            ZgemmTranspose::None,
+            ZgemmTranspose::None,
+            Complex64::new(1.0, 0.0),
+            self.matrix.view(),
+            block,
+            Complex64::ZERO,
+            output.view_mut(),
+        );
         Ok(())
     }
 
@@ -652,6 +757,36 @@ impl LinearOperator for MatrixMarketOperator {
                 .zip(self.values[start..end].iter())
                 .map(|(&column, &value)| value * vector[column])
                 .sum::<Complex64>();
+        }
+
+        Ok(())
+    }
+
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        validate_dimension(self.dimension, block.nrows())?;
+        validate_dimension(self.dimension, output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+
+        output.fill(Complex64::ZERO);
+        for row in 0..self.dimension {
+            let start = self.row_offsets[row];
+            let end = self.row_offsets[row + 1];
+            for entry in start..end {
+                let source = self.columns[entry];
+                let value = self.values[entry];
+                for column in 0..block.ncols() {
+                    output[[row, column]] += value * block[[source, column]];
+                }
+            }
         }
 
         Ok(())
@@ -724,6 +859,59 @@ impl LinearOperator for ConvectionDiffusionOperator {
                 }
 
                 output[k] = acc;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_block_into(
+        &self,
+        block: ArrayView2<'_, Complex64>,
+        mut output: ArrayViewMut2<'_, Complex64>,
+    ) -> Result<(), IramError> {
+        let n = self.dimension();
+        validate_dimension(n, block.nrows())?;
+        validate_dimension(n, output.nrows())?;
+        if block.ncols() != output.ncols() {
+            return Err(IramError::DimensionMismatch {
+                expected: block.ncols(),
+                got: output.ncols(),
+            });
+        }
+
+        let m = self.m;
+        let h = self.h();
+        let inv_h2 = 1.0 / (h * h);
+        let conv = self.rho / (2.0 * h);
+
+        let center_scale = Complex64::new(-4.0 * inv_h2, 0.0);
+        let left_scale = Complex64::new(inv_h2 - conv, 0.0);
+        let right_scale = Complex64::new(inv_h2 + conv, 0.0);
+        let vertical_scale = Complex64::new(inv_h2, 0.0);
+
+        for j in 0..m {
+            let row_start = j * m;
+            for i in 0..m {
+                let k = row_start + i;
+                for column in 0..block.ncols() {
+                    let mut acc = block[[k, column]] * center_scale;
+
+                    if i > 0 {
+                        acc += block[[k - 1, column]] * left_scale;
+                    }
+                    if i + 1 < m {
+                        acc += block[[k + 1, column]] * right_scale;
+                    }
+                    if j > 0 {
+                        acc += block[[k - m, column]] * vertical_scale;
+                    }
+                    if j + 1 < m {
+                        acc += block[[k + m, column]] * vertical_scale;
+                    }
+
+                    output[[k, column]] = acc;
+                }
             }
         }
 
@@ -874,10 +1062,13 @@ fn validate_dimension(expected: usize, got: usize) -> Result<(), IramError> {
 
 #[cfg(test)]
 mod tests {
-    use ndarray::Array1;
+    use ndarray::{Array1, Array2, ShapeBuilder};
     use num_complex::Complex64;
 
-    use super::{ConvectionDiffusionOperator, LinearOperator, parse_complex_token};
+    use super::{
+        ConvectionDiffusionOperator, DenseMatrixOperator, GrcarOperator, LinearOperator,
+        parse_complex_token,
+    };
 
     #[test]
     fn convection_diffusion_dimension_matches_grid() {
@@ -930,5 +1121,56 @@ mod tests {
                 Complex64::new(60.0, -10.0),
             ]
         );
+    }
+
+    #[test]
+    fn block_apply_matches_column_matvecs_for_builtin_operators() {
+        assert_block_apply_matches_column_matvecs(&GrcarOperator::new(7, 3));
+        assert_block_apply_matches_column_matvecs(&ConvectionDiffusionOperator::new(3, 1.5));
+        let dense = DenseMatrixOperator {
+            matrix: Array2::from_shape_fn((4, 4).f(), |(row, column)| {
+                Complex64::new((row + 2 * column + 1) as f64, (row + column) as f64 / 5.0)
+            }),
+            label: "test dense matrix".to_string(),
+        };
+        assert_block_apply_matches_column_matvecs(&dense);
+
+        let content = "\
+%%MatrixMarket matrix coordinate complex general
+4 4 6
+1 1 2.0 0.0
+1 3 -1.0 0.5
+2 2 3.0 0.0
+3 1 0.0 2.0
+4 2 -4.0 0.0
+4 4 5.0 -1.0
+";
+        let matrix_market = super::parse_matrix_market(content, "test matrix".to_string())
+            .expect("Matrix Market matrix should parse");
+        assert_block_apply_matches_column_matvecs(&matrix_market);
+    }
+
+    fn assert_block_apply_matches_column_matvecs(operator: &dyn LinearOperator) {
+        let dimension = operator.dimension();
+        let block = Array2::from_shape_fn((dimension, 3).f(), |(row, column)| {
+            Complex64::new((row + 1) as f64 / 7.0, -((column + 2) as f64) / 11.0)
+        });
+        let mut block_output = Array2::zeros((dimension, block.ncols()).f());
+        operator
+            .apply_block_into(block.view(), block_output.view_mut())
+            .expect("block application should succeed");
+
+        for column in 0..block.ncols() {
+            let mut scalar_output = Array1::zeros(dimension);
+            operator
+                .apply_into(block.column(column), scalar_output.view_mut())
+                .expect("scalar application should succeed");
+            for row in 0..dimension {
+                assert!(
+                    (block_output[[row, column]] - scalar_output[row]).norm() <= 1.0e-12,
+                    "block column {column}, row {row} differs"
+                );
+            }
+        }
     }
 }

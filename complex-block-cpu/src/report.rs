@@ -20,7 +20,6 @@ pub struct IterationLog {
     pub peak_memory_bytes: usize,
     pub happy_breakdown: bool,
     pub wanted: Vec<RitzEstimate>,
-    pub shifts: Vec<Complex64>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,13 +51,20 @@ impl SolveReport {
         writeln!(&mut output, "start vector: {}", self.start_description).ok();
         writeln!(&mut output, "target: {}", self.config.target).ok();
         writeln!(&mut output, "requested eigenvalues: {}", self.config.nev).ok();
+        writeln!(&mut output, "block size: {}", self.config.block_size).ok();
         writeln!(
             &mut output,
-            "Arnoldi subspace dimension (ncv): {}",
+            "Arnoldi block iterations (ncv): {}",
             self.config.ncv
         )
         .ok();
         writeln!(&mut output, "tolerance: {:.3e}", self.config.tol).ok();
+        writeln!(
+            &mut output,
+            "Ritz selection inflation: {:.3e}",
+            self.config.ritz_inflation,
+        )
+        .ok();
         writeln!(&mut output, "max restarts: {}", self.config.max_restarts).ok();
         writeln!(&mut output).ok();
 
@@ -147,21 +153,6 @@ impl SolveReport {
                 )
                 .ok();
             });
-
-            if log.shifts.is_empty() {
-                writeln!(&mut output, "      shifts: none").ok();
-            } else {
-                writeln!(&mut output, "      shifts:").ok();
-                log.shifts.iter().enumerate().for_each(|(index, shift)| {
-                    writeln!(
-                        &mut output,
-                        "        {:>2}. {}",
-                        index + 1,
-                        format_complex(*shift),
-                    )
-                    .ok();
-                });
-            }
         });
 
         output

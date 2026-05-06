@@ -32,10 +32,12 @@ impl fmt::Display for SpectrumTarget {
 #[derive(Debug, Clone)]
 pub struct SolverConfig {
     pub nev: usize,
+    pub block_size: usize,
     pub ncv: usize,
     pub max_restarts: usize,
     pub tol: f64,
     pub breakdown_tol: f64,
+    pub ritz_inflation: f64,
     pub target: SpectrumTarget,
 }
 
@@ -60,17 +62,34 @@ impl SolverConfig {
             )));
         }
 
-        if self.ncv <= self.nev {
+        if self.block_size == 0 {
+            return Err(IramError::InvalidConfig(
+                "block_size must be strictly positive".to_string(),
+            ));
+        }
+
+        if self.block_size > dimension {
             return Err(IramError::InvalidConfig(format!(
-                "ncv ({}) must be larger than nev ({})",
-                self.ncv, self.nev,
+                "block_size ({}) cannot exceed the operator dimension ({dimension})",
+                self.block_size,
             )));
         }
 
-        if self.ncv > dimension {
+        if self.ncv == 0 {
+            return Err(IramError::InvalidConfig(
+                "ncv must be strictly positive".to_string(),
+            ));
+        }
+
+        let krylov_capacity = self.ncv.checked_mul(self.block_size).ok_or_else(|| {
+            IramError::InvalidConfig("ncv * block_size overflows usize".to_string())
+        })?;
+
+        let effective_capacity = krylov_capacity.min(dimension);
+        if effective_capacity <= self.nev {
             return Err(IramError::InvalidConfig(format!(
-                "ncv ({}) cannot exceed the operator dimension ({dimension})",
-                self.ncv,
+                "min(ncv * block_size, dimension) ({effective_capacity}) must be larger than nev ({})",
+                self.nev,
             )));
         }
 
@@ -86,13 +105,12 @@ impl SolverConfig {
             ));
         }
 
+        if !self.ritz_inflation.is_finite() || self.ritz_inflation < 1.0 {
+            return Err(IramError::InvalidConfig(
+                "ritz_inflation must be a finite number >= 1".to_string(),
+            ));
+        }
+
         Ok(())
     }
-}
-
-pub fn recommended_ncv(nev: usize, dimension: usize) -> usize {
-    let lower_bound = nev.saturating_add(2);
-    let heuristic = nev.saturating_mul(2).saturating_add(8);
-
-    heuristic.max(lower_bound).min(dimension)
 }

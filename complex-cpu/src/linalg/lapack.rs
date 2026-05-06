@@ -8,6 +8,12 @@ pub enum ZgemvTranspose {
     ConjugateTranspose,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ZgemmTranspose {
+    None,
+    ConjugateTranspose,
+}
+
 #[derive(Debug)]
 pub struct SchurOutput {
     /// Eigenvalues.
@@ -76,6 +82,22 @@ fn identity_fortran_vec(n: usize) -> Vec<Complex64> {
 }
 
 unsafe extern "C" {
+    fn zgemm_(
+        transa: *const c_char,
+        transb: *const c_char,
+        m: *const c_int,
+        n: *const c_int,
+        k: *const c_int,
+        alpha: *const Complex64,
+        a: *const Complex64,
+        lda: *const c_int,
+        b: *const Complex64,
+        ldb: *const c_int,
+        beta: *const Complex64,
+        c: *mut Complex64,
+        ldc: *const c_int,
+    );
+
     fn zgemv_(
         trans: *const c_char,
         m: *const c_int,
@@ -89,6 +111,94 @@ unsafe extern "C" {
         y: *mut Complex64,
         incy: *const c_int,
     );
+}
+
+fn trans_char(trans: ZgemmTranspose) -> c_char {
+    match trans {
+        ZgemmTranspose::None => b'N' as c_char,
+        ZgemmTranspose::ConjugateTranspose => b'C' as c_char,
+    }
+}
+
+fn transposed_shape(rows: usize, columns: usize, trans: ZgemmTranspose) -> (usize, usize) {
+    match trans {
+        ZgemmTranspose::None => (rows, columns),
+        ZgemmTranspose::ConjugateTranspose => (columns, rows),
+    }
+}
+
+pub fn zgemm(
+    trans_a: ZgemmTranspose,
+    trans_b: ZgemmTranspose,
+    a: ArrayView2<'_, Complex64>,
+    b: ArrayView2<'_, Complex64>,
+) -> Array2<Complex64> {
+    let (a_rows, a_columns) = a.dim();
+    let (b_rows, b_columns) = b.dim();
+    let (a_effective_rows, a_effective_columns) = transposed_shape(a_rows, a_columns, trans_a);
+    let (b_effective_rows, b_effective_columns) = transposed_shape(b_rows, b_columns, trans_b);
+    assert_eq!(a_effective_columns, b_effective_rows);
+
+    let a_strides = a.strides();
+    assert!(
+        a_rows <= 1 || a_strides[0] == 1,
+        "zgemm expects column-major left matrix storage"
+    );
+    assert!(
+        a_columns <= 1 || a_strides[1] == a_rows as isize,
+        "zgemm expects column-major left matrix storage"
+    );
+    let b_strides = b.strides();
+    assert!(
+        b_rows <= 1 || b_strides[0] == 1,
+        "zgemm expects column-major right matrix storage"
+    );
+    assert!(
+        b_columns <= 1 || b_strides[1] == b_rows as isize,
+        "zgemm expects column-major right matrix storage"
+    );
+
+    let a_memory = a
+        .as_slice_memory_order()
+        .expect("zgemm expects contiguous left matrix storage");
+    let b_memory = b
+        .as_slice_memory_order()
+        .expect("zgemm expects contiguous right matrix storage");
+    let mut result = Array2::zeros((a_effective_rows, b_effective_columns).f());
+    let result_memory = result
+        .as_slice_memory_order_mut()
+        .expect("zgemm result must be contiguous");
+
+    let m = a_effective_rows as c_int;
+    let n = b_effective_columns as c_int;
+    let k = a_effective_columns as c_int;
+    let lda = a_rows.max(1) as c_int;
+    let ldb = b_rows.max(1) as c_int;
+    let ldc = a_effective_rows.max(1) as c_int;
+    let alpha = Complex64::new(1.0, 0.0);
+    let beta = Complex64::ZERO;
+    let transa = trans_char(trans_a);
+    let transb = trans_char(trans_b);
+
+    unsafe {
+        zgemm_(
+            &transa,
+            &transb,
+            &m,
+            &n,
+            &k,
+            &alpha,
+            a_memory.as_ptr(),
+            &lda,
+            b_memory.as_ptr(),
+            &ldb,
+            &beta,
+            result_memory.as_mut_ptr(),
+            &ldc,
+        );
+    }
+
+    result
 }
 
 pub fn zgemv(
@@ -274,119 +384,106 @@ pub fn ztrevc_right_selected(
     Ok(z.dot(&x_sel))
 }
 
-unsafe extern "C" {
-    fn zlaqr5_(
-        wantt: *const c_char,
-        wantz: *const c_char,
-        kacc22: *const c_int,
-        n: *const c_int,
-        ktop: *const c_int,
-        kbot: *const c_int,
-        nshfts: *const c_int,
-        s: *mut Complex64,
-        h: *mut Complex64,
-        ldh: *const c_int,
-        iloz: *const c_int,
-        ihiz: *const c_int,
-        z: *mut Complex64,
-        ldz: *const c_int,
-        v: *mut Complex64,
-        ldv: *const c_int,
-        u: *mut Complex64,
-        ldu: *const c_int,
-        nv: *const c_int,
-        wv: *mut Complex64,
-        ldwv: *const c_int,
-        nh: *const c_int,
-        wh: *mut Complex64,
-        ldwh: *const c_int,
-    );
-}
-
-pub fn zlaqr52(
-    hessenberg: &mut Array2<Complex64>,
+pub fn shifted_qr_filter(
+    hessenberg: &Array2<Complex64>,
     shifts: &[Complex64],
 ) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
     let (h_rows, h_cols) = hessenberg.dim();
     if h_rows != h_cols {
         return Err("H must be square".into());
     }
-    if shifts.len() < 2 {
-        return Err("ZLAQR5 needs at least two shifts".into());
-    }
 
     let n = h_rows;
-    let n_i = n as c_int;
+    let mut h = from_fortran_vec(n, n, to_fortran_vec(hessenberg));
+    let mut rotation = from_fortran_vec(n, n, identity_fortran_vec(n));
 
-    let wantt: c_char = b'T' as c_char;
-    let wantz: c_char = b'T' as c_char;
-    let kacc22: c_int = 1;
-    let ktop: c_int = 1;
-    let kbot: c_int = n_i;
-    let ldh: c_int = n_i;
-    let ldz: c_int = n_i;
+    for &shift in shifts {
+        let mut shifted = h.clone();
+        for index in 0..n {
+            shifted[[index, index]] -= shift;
+        }
 
-    let mut s = Vec::with_capacity(shifts.len() + (shifts.len() & 1));
-    s.extend_from_slice(shifts);
-    if s.len() % 2 == 1 {
-        s.push(Complex64::ZERO);
-    }
-
-    let ns_even = s.len();
-    let nshfts: c_int = ns_even as c_int;
-    let nbmps = ns_even / 2;
-    let kdu = 4 * nbmps;
-
-    let ldv: c_int = 3;
-    let ldu: c_int = kdu.max(1) as c_int;
-
-    let nv: c_int = n_i;
-    let ldwv: c_int = nv.max(1);
-
-    let nh: c_int = n_i;
-    let ldwh: c_int = kdu.max(1) as c_int;
-
-    let mut h = to_fortran_vec(hessenberg);
-    let mut z = identity_fortran_vec(n);
-
-    let mut v = vec![zero(); (ldv as usize) * nbmps.max(1)];
-    let mut u = vec![zero(); (ldu as usize) * kdu.max(1)];
-    let mut wv = vec![zero(); (ldwv as usize) * kdu.max(1)];
-    let mut wh = vec![zero(); (ldwh as usize) * (nh as usize)];
-
-    let iloz: c_int = 1;
-    let ihiz: c_int = n_i;
-
-    unsafe {
-        zlaqr5_(
-            &wantt,
-            &wantz,
-            &kacc22,
-            &n_i,
-            &ktop,
-            &kbot,
-            &nshfts,
-            s.as_mut_ptr(),
-            h.as_mut_ptr(),
-            &ldh,
-            &iloz,
-            &ihiz,
-            z.as_mut_ptr(),
-            &ldz,
-            v.as_mut_ptr(),
-            &ldv,
-            u.as_mut_ptr(),
-            &ldu,
-            &nv,
-            wv.as_mut_ptr(),
-            &ldwv,
-            &nh,
-            wh.as_mut_ptr(),
-            &ldwh,
+        let q = zgeqrf_q(&shifted)?;
+        let q_star_h = zgemm(
+            ZgemmTranspose::ConjugateTranspose,
+            ZgemmTranspose::None,
+            q.view(),
+            h.view(),
+        );
+        h = zgemm(
+            ZgemmTranspose::None,
+            ZgemmTranspose::None,
+            q_star_h.view(),
+            q.view(),
+        );
+        cleanup_hessenberg_roundoff(&mut h);
+        rotation = zgemm(
+            ZgemmTranspose::None,
+            ZgemmTranspose::None,
+            rotation.view(),
+            q.view(),
         );
     }
 
-    Ok((from_fortran_vec(n, n, z), from_fortran_vec(n, n, h)))
+    Ok((rotation, h))
+}
+
+fn zgeqrf_q(matrix: &Array2<Complex64>) -> Result<Array2<Complex64>, String> {
+    let (rows, cols) = matrix.dim();
+    let m = rows as i32;
+    let n = cols as i32;
+    let k = m.min(n);
+    let lda = m.max(1);
+
+    let mut q = to_fortran_vec(matrix);
+    let mut tau = vec![zero(); k as usize];
+    let mut work_query = [zero(); 1];
+    let mut info = 0;
+
+    unsafe {
+        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work_query, -1, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zgeqrf workspace query failed, info = {}", info));
+    }
+
+    let lwork = (work_query[0].re as i32).max(1);
+    let mut work = vec![zero(); lwork as usize];
+
+    unsafe {
+        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work, lwork, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zgeqrf failed, info = {}", info));
+    }
+
+    work_query[0] = zero();
+    unsafe {
+        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work_query, -1, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zungqr workspace query failed, info = {}", info));
+    }
+
+    let lwork = (work_query[0].re as i32).max(1);
+    let mut work = vec![zero(); lwork as usize];
+
+    unsafe {
+        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work, lwork, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zungqr failed, info = {}", info));
+    }
+
+    Ok(from_fortran_vec(rows, cols, q))
+}
+
+fn cleanup_hessenberg_roundoff(h: &mut Array2<Complex64>) {
+    for row in 0..h.nrows() {
+        for column in 0..row.saturating_sub(1) {
+            h[[row, column]] = Complex64::ZERO;
+        }
+    }
 }
 
 pub fn last_r_col_without_diag_from_zgeqrf(
@@ -514,6 +611,51 @@ mod tests {
     }
 
     #[test]
+    fn zgemm_wraps_column_major_blas() {
+        let a = Array2::from_shape_vec(
+            (2, 2).f(),
+            vec![
+                Complex64::new(1.0, 0.0),
+                Complex64::new(3.0, 0.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(4.0, 0.0),
+            ],
+        )
+        .unwrap();
+        let b = Array2::from_shape_vec(
+            (2, 2).f(),
+            vec![
+                Complex64::new(5.0, 0.0),
+                Complex64::new(7.0, 0.0),
+                Complex64::new(6.0, 0.0),
+                Complex64::new(8.0, 0.0),
+            ],
+        )
+        .unwrap();
+
+        let c = zgemm(
+            ZgemmTranspose::None,
+            ZgemmTranspose::None,
+            a.view(),
+            b.view(),
+        );
+
+        assert_eq!(
+            c,
+            Array2::from_shape_vec(
+                (2, 2).f(),
+                vec![
+                    Complex64::new(19.0, 0.0),
+                    Complex64::new(43.0, 0.0),
+                    Complex64::new(22.0, 0.0),
+                    Complex64::new(50.0, 0.0),
+                ],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "zgemv expects column-major matrix storage")]
     fn zgemv_rejects_row_major_matrix() {
         let a = Array2::from_shape_vec(
@@ -567,8 +709,8 @@ mod tests {
     }
 
     #[test]
-    fn zlaqr_test() {
-        let mut h = array![
+    fn shifted_qr_filter_preserves_similarity() {
+        let h = array![
             [
                 Complex64::new(1.0, 0.0),
                 Complex64::new(2.0, 1.0),
@@ -586,15 +728,38 @@ mod tests {
             ],
         ];
 
-        let out = zlaqr52(
-            &mut h,
-            &[Complex64::new(3.0, 1.0), Complex64::new(1.0, 0.0)],
+        let (q, filtered_h) = shifted_qr_filter(
+            &h,
+            &[
+                Complex64::new(3.0, 1.0),
+                Complex64::new(1.0, 0.0),
+                Complex64::new(2.0, -0.5),
+            ],
         )
         .unwrap();
 
-        let q = out.0;
         let q_star = q.t().mapv(|x| x.conj());
-        let res = q.dot(&out.1).dot(&q_star);
-        println!("res == {:.3?}", res);
+        let reconstructed = q.dot(&filtered_h).dot(&q_star);
+        let reconstruction_error = frobenius_norm(&(reconstructed - h));
+        assert!(
+            reconstruction_error < 1.0e-10,
+            "reconstruction_error={reconstruction_error}"
+        );
+
+        let identity = q_star.dot(&q);
+        let mut expected_identity = Array2::zeros((3, 3).f());
+        for index in 0..3 {
+            expected_identity[[index, index]] = Complex64::new(1.0, 0.0);
+        }
+        let unitary_error = frobenius_norm(&(identity - expected_identity));
+        assert!(unitary_error < 1.0e-10, "unitary_error={unitary_error}");
+    }
+
+    fn frobenius_norm(matrix: &Array2<Complex64>) -> f64 {
+        matrix
+            .iter()
+            .map(|entry| entry.norm_sqr())
+            .sum::<f64>()
+            .sqrt()
     }
 }

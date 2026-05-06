@@ -7,6 +7,14 @@ use rand::{Rng, RngExt};
 use crate::error::IramError;
 use crate::linalg::lapack::{ZgemvTranspose, zgemv};
 
+const REORTHOGONALIZATION_THRESHOLD: f64 = f64::EPSILON * 1000.0;
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrthogonalizedVector {
+    pub residual_norm: f64,
+    pub happy_breakdown: bool,
+}
+
 /// Нормализация вектора
 pub fn normalize(vector: &mut Array1<Complex64>, context: &'static str) -> Result<f64, IramError> {
     let norm = norm2(vector);
@@ -161,6 +169,108 @@ pub fn orthogonalize2_twice(
         }
 
         zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
+    }
+}
+
+pub fn orthogonalize_with_reorthogonalization(
+    candidate: &mut Array1<Complex64>,
+    basis: &ArrayView2<Complex64>,
+    h_column: &mut [Complex64],
+    reference_norm: f64,
+    breakdown_tol: f64,
+) -> OrthogonalizedVector {
+    let (m, n) = basis.dim();
+    assert_eq!(candidate.len(), m);
+    assert!(h_column.len() >= n);
+
+    let one = Complex64::new(1.0, 0.0);
+    let zero = Complex64::ZERO;
+    let minus_one = Complex64::new(-1.0, 0.0);
+    let mut projection = vec![Complex64::ZERO; n];
+
+    {
+        let x = candidate
+            .as_slice_mut()
+            .expect("candidate must be contiguous");
+
+        for _ in 0..2 {
+            projection.fill(Complex64::ZERO);
+
+            zgemv(
+                ZgemvTranspose::ConjugateTranspose,
+                *basis,
+                one,
+                x,
+                zero,
+                &mut projection,
+            );
+
+            for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
+                *h += p;
+            }
+
+            zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
+        }
+    }
+
+    let mut residual_norm = norm2(candidate);
+    if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
+        return OrthogonalizedVector {
+            residual_norm,
+            happy_breakdown: true,
+        };
+    }
+
+    scale_in_place(candidate, Complex64::new(1.0 / residual_norm, 0.0));
+
+    projection.fill(Complex64::ZERO);
+    {
+        let x = candidate
+            .as_slice_mut()
+            .expect("candidate must be contiguous");
+        zgemv(
+            ZgemvTranspose::ConjugateTranspose,
+            *basis,
+            one,
+            x,
+            zero,
+            &mut projection,
+        );
+    }
+
+    let correction_norm = projection
+        .iter()
+        .map(|entry| entry.norm_sqr())
+        .sum::<f64>()
+        .sqrt();
+
+    if correction_norm > REORTHOGONALIZATION_THRESHOLD {
+        for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
+            *h += p * Complex64::new(residual_norm, 0.0);
+        }
+
+        {
+            let x = candidate
+                .as_slice_mut()
+                .expect("candidate must be contiguous");
+            zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
+        }
+
+        let reorthogonalized_norm = norm2(candidate);
+        residual_norm *= reorthogonalized_norm;
+        if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
+            return OrthogonalizedVector {
+                residual_norm,
+                happy_breakdown: true,
+            };
+        }
+
+        scale_in_place(candidate, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
+    }
+
+    OrthogonalizedVector {
+        residual_norm,
+        happy_breakdown: false,
     }
 }
 

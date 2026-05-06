@@ -7,7 +7,7 @@ use crate::arnoldi::{ArnoldiFactorization, continue_arnoldi, run_arnoldi};
 use crate::config::SolverConfig;
 use crate::error::IramError;
 use crate::linalg::lapack::*;
-use crate::linalg::ops::{is_numerical_breakdown, norm2, normalize, orthogonalize2_twice};
+use crate::linalg::ops::{normalize, orthogonalize_with_reorthogonalization};
 use crate::linalg::small::{compute_ritz_values, retrive_ritz_vectors};
 use crate::memory;
 use crate::operator::LinearOperator;
@@ -179,7 +179,8 @@ fn implicit_restart_and_extend(
 
     // A V_m = V_m H_m + beta v_{m+1} e_m^T
     let beta = factorization.trailing_subdiagonal();
-    let (rotation, h) = zlaqr52(&mut factorization.square_hessenberg(), shifts).unwrap();
+    let (rotation, h) = shifted_qr_filter(&factorization.square_hessenberg(), shifts)
+        .map_err(IramError::Spectral)?;
 
     let rotated_basis = rotate_basis(&factorization.basis.slice(s![.., ..m]), &rotation, k);
     let mut restarted_hessenberg =
@@ -203,20 +204,21 @@ fn implicit_restart_and_extend(
     residual *= h_coupling;
     residual.scaled_add(residual_coupling, &factorization.basis.column(m));
 
+    let residual_reference_norm = (h_coupling.norm_sqr() + residual_coupling.norm_sqr()).sqrt();
     let mut h_column_correction = vec![Complex64::default(); k];
-    orthogonalize2_twice(
+    let orthogonalized = orthogonalize_with_reorthogonalization(
         &mut residual,
         &rotated_basis.view(),
         &mut h_column_correction,
+        residual_reference_norm,
+        breakdown_tol,
     );
     h_column_correction
         .iter()
         .enumerate()
         .for_each(|(row, &value)| restarted_hessenberg[[row, k - 1]] += value);
 
-    let residual_norm = norm2(&residual);
-    let residual_reference_norm = (h_coupling.norm_sqr() + residual_coupling.norm_sqr()).sqrt();
-    if is_numerical_breakdown(residual_norm, residual_reference_norm, breakdown_tol) {
+    if orthogonalized.happy_breakdown {
         restarted_hessenberg[[k, k - 1]] = Complex64::ZERO;
         return Ok(ArnoldiFactorization {
             basis: rotated_basis,
@@ -226,10 +228,7 @@ fn implicit_restart_and_extend(
         });
     }
 
-    restarted_hessenberg[[k, k - 1]] = Complex64::new(residual_norm, 0.0);
-    residual
-        .iter_mut()
-        .for_each(|entry| *entry /= residual_norm);
+    restarted_hessenberg[[k, k - 1]] = Complex64::new(orthogonalized.residual_norm, 0.0);
 
     let mut continued_basis =
         Array2::<Complex64>::zeros((factorization.basis.nrows(), target_steps + 1).f());

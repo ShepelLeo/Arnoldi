@@ -3,7 +3,7 @@ use ndarray::{Array1, Array2, ShapeBuilder, s};
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::ops::{is_numerical_breakdown, norm2, normalize, orthogonalize2_twice};
+use crate::linalg::ops::{norm2, normalize, orthogonalize_with_reorthogonalization};
 use crate::operator::LinearOperator;
 
 /// Ответ процесса
@@ -97,28 +97,26 @@ pub fn continue_arnoldi(
         *matvec_count += 1;
 
         h_column[..=step].fill(Complex64::ZERO);
-        orthogonalize2_twice(
+        let orthogonalized = orthogonalize_with_reorthogonalization(
             &mut candidate,
             &basis.slice(s![.., 0..=step]),
             &mut h_column[..=step],
+            candidate_old,
+            breakdown_tol,
         );
 
         for row in 0..=step {
             hessenberg[[row, step]] = h_column[row];
         }
-        let candidate_norm = norm2(&candidate);
         performed_steps = step + 1;
 
-        if is_numerical_breakdown(candidate_norm, candidate_old, breakdown_tol) {
+        if orthogonalized.happy_breakdown {
             happy_breakdown = true;
             hessenberg[[step + 1, step]] = Complex64::new(0.0, 0.0);
             break;
         }
 
-        hessenberg[[step + 1, step]] = Complex64::new(candidate_norm, 0.0);
-        candidate
-            .iter_mut()
-            .for_each(|entry| *entry /= candidate_norm);
+        hessenberg[[step + 1, step]] = Complex64::new(orthogonalized.residual_norm, 0.0);
         basis.column_mut(step + 1).assign(&candidate);
     }
 
@@ -132,10 +130,10 @@ pub fn continue_arnoldi(
 
 #[cfg(test)]
 mod tests {
-    use ndarray::Array1;
+    use ndarray::{Array1, Array2, ShapeBuilder, s};
     use num_complex::Complex64;
 
-    use crate::operator::IdentityOperator;
+    use crate::operator::{ConvectionDiffusionOperator, IdentityOperator, LinearOperator};
 
     use super::run_arnoldi;
 
@@ -155,5 +153,62 @@ mod tests {
         assert_eq!(factorization.performed_steps, 1);
         assert!(factorization.happy_breakdown);
         assert_eq!(matvec_count, 1);
+    }
+
+    #[test]
+    fn arnoldi_factorization_preserves_relation_and_orthogonality() {
+        let operator = ConvectionDiffusionOperator::new(4, 0.0);
+        let start = Array1::from_iter(
+            (0..operator.dimension())
+                .map(|index| Complex64::new(index as f64 + 1.0, -(index as f64 + 0.5))),
+        );
+        let target_steps = 5;
+        let mut matvec_count = 0;
+        let factorization =
+            run_arnoldi(&operator, &start, target_steps, 1.0e-12, &mut matvec_count)
+                .expect("Arnoldi factorization should succeed");
+
+        assert_eq!(factorization.performed_steps, target_steps);
+        assert!(!factorization.happy_breakdown);
+
+        let steps = factorization.performed_steps;
+        let basis = factorization.basis.slice(s![.., 0..steps]).to_owned();
+        let extended_basis = factorization.basis.slice(s![.., 0..=steps]).to_owned();
+        let hessenberg = factorization
+            .hessenberg
+            .slice(s![0..=steps, 0..steps])
+            .to_owned();
+
+        let mut applied = Array2::zeros((operator.dimension(), steps).f());
+        for column in 0..steps {
+            operator
+                .apply_into(basis.column(column), applied.column_mut(column))
+                .unwrap();
+        }
+
+        let relation_error = frobenius_norm(&(applied - extended_basis.dot(&hessenberg)));
+        assert!(relation_error < 1.0e-8, "relation_error={relation_error}");
+
+        let gram = extended_basis
+            .t()
+            .mapv(|entry| entry.conj())
+            .dot(&extended_basis);
+        let mut identity = Array2::zeros((steps + 1, steps + 1).f());
+        for diagonal in 0..=steps {
+            identity[[diagonal, diagonal]] = Complex64::new(1.0, 0.0);
+        }
+        let orthogonality_error = frobenius_norm(&(gram - identity));
+        assert!(
+            orthogonality_error < 1.0e-8,
+            "orthogonality_error={orthogonality_error}"
+        );
+    }
+
+    fn frobenius_norm(matrix: &Array2<Complex64>) -> f64 {
+        matrix
+            .iter()
+            .map(|entry| entry.norm_sqr())
+            .sum::<f64>()
+            .sqrt()
     }
 }

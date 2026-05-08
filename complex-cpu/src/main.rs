@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long, default_value_t = 1.0e-12)]
     breakdown_tol: f64,
 
+    /// Расширение окружности для выбора Ritz-пар, удерживаемых на рестарте
+    #[arg(long, default_value_t = 1.0)]
+    ritz_inflation: f64,
+
     /// Искомая часть спектра
     #[arg(long, value_enum, default_value_t = TargetArg::LargestMagnitude)]
     target: TargetArg,
@@ -130,6 +134,7 @@ fn run() -> Result<(), IramError> {
         max_restarts: cli.max_restarts,
         tol: cli.tol,
         breakdown_tol: cli.breakdown_tol,
+        ritz_inflation: cli.ritz_inflation,
         target: cli.target.into(),
     };
 

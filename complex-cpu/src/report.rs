@@ -59,6 +59,12 @@ impl SolveReport {
         )
         .ok();
         writeln!(&mut output, "tolerance: {:.3e}", self.config.tol).ok();
+        writeln!(
+            &mut output,
+            "Ritz selection inflation: {:.3e}",
+            self.config.ritz_inflation,
+        )
+        .ok();
         writeln!(&mut output, "max restarts: {}", self.config.max_restarts).ok();
         writeln!(&mut output).ok();
 

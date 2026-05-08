@@ -54,14 +54,22 @@ pub fn solve(
         let mut hessenberg_schur = compute_ritz_values(&square_hessenberg);
 
         // Выбираем желаемые СЗН матрицы Хессенберга
-        let selection =
-            select_ritz_values(&hessenberg_schur.w, config.target, config.nev, krylov_dim)?;
+        let selection = select_ritz_values(
+            &hessenberg_schur.w,
+            config.target,
+            config.nev,
+            krylov_dim,
+            config.ritz_inflation,
+        )?;
 
         let ritz_vectors =
             retrive_ritz_vectors(&mut hessenberg_schur, &selection.wanted, krylov_dim);
 
-        let result: Vec<RitzEstimate> = selection
-            .wanted
+        let mut wanted = selection.wanted.clone();
+        wanted.sort();
+
+
+        let result: Vec<RitzEstimate> = wanted
             .iter()
             .enumerate()
             .map(|(i, &idx)| {
@@ -291,6 +299,7 @@ mod tests {
             max_restarts: 5,
             tol: 1.0e-10,
             breakdown_tol: 1.0e-12,
+            ritz_inflation: 1.0,
             target: SpectrumTarget::LargestMagnitude,
         };
         let report = solve(&operator, start, config, "unit vector")
@@ -313,6 +322,7 @@ mod tests {
             max_restarts: 20,
             tol: 1.0e-10,
             breakdown_tol: 1.0e-12,
+            ritz_inflation: 1.0,
             target: SpectrumTarget::SmallestMagnitude,
         };
 

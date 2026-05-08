@@ -41,3 +41,8 @@ perf.data.old
 # Temp
 tmp/
 temp/
+
+**/*.txt
+*/*.txt
+*.txt
+complex-cpu/convdiff_report.txt

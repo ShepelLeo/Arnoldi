@@ -36,6 +36,7 @@ pub struct SolverConfig {
     pub max_restarts: usize,
     pub tol: f64,
     pub breakdown_tol: f64,
+    pub ritz_inflation: f64,
     pub target: SpectrumTarget,
 }
 
@@ -83,6 +84,12 @@ impl SolverConfig {
         if !self.breakdown_tol.is_finite() || self.breakdown_tol <= 0.0 {
             return Err(IramError::InvalidConfig(
                 "breakdown_tol must be a positive finite number".to_string(),
+            ));
+        }
+
+        if !self.ritz_inflation.is_finite() || self.ritz_inflation < 1.0 {
+            return Err(IramError::InvalidConfig(
+                "ritz_inflation must be a finite number >= 1".to_string(),
             ));
         }
 

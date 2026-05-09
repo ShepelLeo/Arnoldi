@@ -65,11 +65,8 @@ pub fn solve(
         let ritz_vectors =
             retrive_ritz_vectors(&mut hessenberg_schur, &selection.wanted, krylov_dim);
 
-        let mut wanted = selection.wanted.clone();
-        wanted.sort();
 
-
-        let result: Vec<RitzEstimate> = wanted
+        let result: Vec<RitzEstimate> = selection.wanted
             .iter()
             .enumerate()
             .map(|(i, &idx)| {

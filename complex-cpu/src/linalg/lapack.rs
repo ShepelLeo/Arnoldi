@@ -111,6 +111,14 @@ unsafe extern "C" {
         y: *mut Complex64,
         incy: *const c_int,
     );
+
+    fn zlartg_(
+        f: *const Complex64,
+        g: *const Complex64,
+        cs: *mut f64,
+        sn: *mut Complex64,
+        r: *mut Complex64,
+    );
 }
 
 fn trans_char(trans: ZgemmTranspose) -> c_char {
@@ -397,85 +405,177 @@ pub fn shifted_qr_filter(
     let mut h = from_fortran_vec(n, n, to_fortran_vec(hessenberg));
     let mut rotation = from_fortran_vec(n, n, identity_fortran_vec(n));
 
-    for &shift in shifts {
-        let mut shifted = h.clone();
-        for index in 0..n {
-            shifted[[index, index]] -= shift;
-        }
-
-        let q = zgeqrf_q(&shifted)?;
-        let q_star_h = zgemm(
-            ZgemmTranspose::ConjugateTranspose,
-            ZgemmTranspose::None,
-            q.view(),
-            h.view(),
-        );
-        h = zgemm(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            q_star_h.view(),
-            q.view(),
-        );
-        cleanup_hessenberg_roundoff(&mut h);
-        rotation = zgemm(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            rotation.view(),
-            q.view(),
-        );
+    if shifts.is_empty() {
+        return Ok((rotation, h));
     }
+
+    for (shift_index, &shift) in shifts.iter().enumerate() {
+        apply_implicit_shift(&mut h, &mut rotation, shift, shift_index);
+        cleanup_hessenberg_roundoff(&mut h);
+    }
+
+    make_subdiagonal_real_nonnegative(&mut h, &mut rotation);
+    deflate_small_subdiagonals(&mut h);
+    cleanup_hessenberg_roundoff(&mut h);
 
     Ok((rotation, h))
 }
 
-fn zgeqrf_q(matrix: &Array2<Complex64>) -> Result<Array2<Complex64>, String> {
-    let (rows, cols) = matrix.dim();
-    let m = rows as i32;
-    let n = cols as i32;
-    let k = m.min(n);
-    let lda = m.max(1);
+fn apply_implicit_shift(
+    h: &mut Array2<Complex64>,
+    rotation: &mut Array2<Complex64>,
+    shift: Complex64,
+    shift_index: usize,
+) {
+    let n = h.nrows();
+    if n < 2 {
+        return;
+    }
 
-    let mut q = to_fortran_vec(matrix);
-    let mut tau = vec![zero(); k as usize];
-    let mut work_query = [zero(); 1];
-    let mut info = 0;
+    let mut istart = 0;
+    while istart < n {
+        let mut iend = n - 1;
+        for i in istart..n - 1 {
+            if should_deflate(h, i) {
+                h[[i + 1, i]] = Complex64::ZERO;
+                iend = i;
+                break;
+            }
+        }
 
+        if istart == iend {
+            istart = iend + 1;
+            continue;
+        }
+
+        let mut f = h[[istart, istart]] - shift;
+        let mut g = h[[istart + 1, istart]];
+
+        for i in istart..iend {
+            let (c, s, r) = zlartg(f, g);
+            if i > istart {
+                h[[i, i - 1]] = r;
+                h[[i + 1, i - 1]] = Complex64::ZERO;
+            }
+
+            apply_givens_from_left(h, i, c, s);
+            apply_givens_from_right(h, i, iend, c, s);
+            accumulate_givens(rotation, i, shift_index, c, s);
+
+            if i < iend - 1 {
+                f = h[[i + 1, i]];
+                g = h[[i + 2, i]];
+            }
+        }
+
+        istart = iend + 1;
+    }
+}
+
+fn zlartg(f: Complex64, g: Complex64) -> (f64, Complex64, Complex64) {
+    let mut c = 0.0;
+    let mut s = Complex64::ZERO;
+    let mut r = Complex64::ZERO;
     unsafe {
-        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work_query, -1, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf workspace query failed, info = {}", info));
+        zlartg_(&f, &g, &mut c, &mut s, &mut r);
     }
 
-    let lwork = (work_query[0].re as i32).max(1);
-    let mut work = vec![zero(); lwork as usize];
+    (c, s, r)
+}
 
-    unsafe {
-        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work, lwork, &mut info);
+fn apply_givens_from_left(h: &mut Array2<Complex64>, i: usize, c: f64, s: Complex64) {
+    let c = Complex64::new(c, 0.0);
+    for column in i..h.ncols() {
+        let upper = h[[i, column]];
+        let lower = h[[i + 1, column]];
+        h[[i, column]] = c * upper + s * lower;
+        h[[i + 1, column]] = -s.conj() * upper + c * lower;
     }
-    if info != 0 {
-        return Err(format!("zgeqrf failed, info = {}", info));
+}
+
+fn apply_givens_from_right(h: &mut Array2<Complex64>, i: usize, iend: usize, c: f64, s: Complex64) {
+    let c = Complex64::new(c, 0.0);
+    for row in 0..=usize::min(i + 2, iend) {
+        let left = h[[row, i]];
+        let right = h[[row, i + 1]];
+        h[[row, i]] = c * left + s.conj() * right;
+        h[[row, i + 1]] = -s * left + c * right;
+    }
+}
+
+fn accumulate_givens(
+    rotation: &mut Array2<Complex64>,
+    i: usize,
+    shift_index: usize,
+    c: f64,
+    s: Complex64,
+) {
+    let c = Complex64::new(c, 0.0);
+    let row_count = usize::min(i + shift_index + 2, rotation.nrows());
+
+    for row in 0..row_count {
+        let left = rotation[[row, i]];
+        let right = rotation[[row, i + 1]];
+        rotation[[row, i]] = c * left + s.conj() * right;
+        rotation[[row, i + 1]] = -s * left + c * right;
+    }
+}
+
+fn make_subdiagonal_real_nonnegative(h: &mut Array2<Complex64>, rotation: &mut Array2<Complex64>) {
+    let n = h.nrows();
+    for j in 0..n.saturating_sub(1) {
+        let subdiagonal = h[[j + 1, j]];
+        let magnitude = subdiagonal.norm();
+        if magnitude == 0.0 || (subdiagonal.im == 0.0 && subdiagonal.re >= 0.0) {
+            continue;
+        }
+
+        let phase = subdiagonal / magnitude;
+        for column in j..n {
+            h[[j + 1, column]] *= phase.conj();
+        }
+        for row in 0..=usize::min(j + 2, n - 1) {
+            h[[row, j + 1]] *= phase;
+        }
+        for row in 0..rotation.nrows() {
+            rotation[[row, j + 1]] *= phase;
+        }
+        h[[j + 1, j]] = Complex64::new(magnitude, 0.0);
+    }
+}
+
+fn deflate_small_subdiagonals(h: &mut Array2<Complex64>) {
+    for i in 0..h.nrows().saturating_sub(1) {
+        if should_deflate(h, i) {
+            h[[i + 1, i]] = Complex64::ZERO;
+        }
+    }
+}
+
+fn should_deflate(h: &Array2<Complex64>, i: usize) -> bool {
+    let mut scale = zabs1(h[[i, i]]) + zabs1(h[[i + 1, i + 1]]);
+    if scale == 0.0 {
+        scale = hessenberg_one_norm(h);
     }
 
-    work_query[0] = zero();
-    unsafe {
-        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work_query, -1, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zungqr workspace query failed, info = {}", info));
-    }
+    h[[i + 1, i]].norm() <= (f64::EPSILON * scale).max(safe_minimum_threshold(h.nrows()))
+}
 
-    let lwork = (work_query[0].re as i32).max(1);
-    let mut work = vec![zero(); lwork as usize];
+fn safe_minimum_threshold(n: usize) -> f64 {
+    f64::MIN_POSITIVE * (n.max(1) as f64 / f64::EPSILON)
+}
 
-    unsafe {
-        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zungqr failed, info = {}", info));
-    }
+fn hessenberg_one_norm(h: &Array2<Complex64>) -> f64 {
+    (0..h.ncols())
+        .map(|column| {
+            let last_row = usize::min(column + 1, h.nrows().saturating_sub(1));
+            (0..=last_row).map(|row| zabs1(h[[row, column]])).sum()
+        })
+        .fold(0.0, f64::max)
+}
 
-    Ok(from_fortran_vec(rows, cols, q))
+fn zabs1(value: Complex64) -> f64 {
+    value.re.abs() + value.im.abs()
 }
 
 fn cleanup_hessenberg_roundoff(h: &mut Array2<Complex64>) {

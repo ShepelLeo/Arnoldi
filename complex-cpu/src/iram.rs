@@ -134,6 +134,7 @@ pub fn solve(
             &factorization,
             &selection.shifts,
             config.ncv + converged,
+            //krylov_dim - selection.shifts.len() + converged,
             config.breakdown_tol,
             &mut total_matvecs,
             selection.wanted.len(),

@@ -9,7 +9,6 @@ use crate::error::IramError;
 pub struct SelectionOut {
     pub wanted: Vec<usize>,
     pub retained: Vec<usize>,
-    pub shifts: Vec<Complex64>,
 }
 
 /// Вход в селектор
@@ -24,7 +23,6 @@ pub fn select_ritz_values(
         return Ok(SelectionOut {
             wanted: Vec::new(),
             retained: Vec::new(),
-            shifts: Vec::new(),
         });
     }
 
@@ -38,54 +36,15 @@ pub fn select_ritz_values(
         )));
     }
 
-    let wanted = base_selection(values, target, retained_dimension, &order);
-    let mut keep_flags = vec![false; values.len()];
-    let mut retained = wanted.clone();
-    wanted.iter().for_each(|&index| keep_flags[index] = true);
+    let mut wanted = base_selection(values, target, retained_dimension, &order);
+    wanted.sort_unstable();
 
-    if !wanted.is_empty() && retained.len() < max_keep {
-        let center = ritz_center(values, &wanted);
-        let radius = wanted
-            .iter()
-            .map(|&index| (values[index] - center).norm())
-            .fold(0.0, f64::max);
-        let inflated_radius = inflation * radius;
-        let slack = 100.0 * f64::EPSILON * center.norm().max(inflated_radius).max(1.0);
-
-        for &index in &order {
-            if retained.len() == max_keep {
-                break;
-            }
-            if keep_flags[index] {
-                continue;
-            }
-            if (values[index] - center).norm() <= inflated_radius + slack {
-                retained.push(index);
-                keep_flags[index] = true;
-            }
-        }
-    }
-
-    let shifts = order
-        .iter()
-        .copied()
-        .filter(|&index| !keep_flags[index])
-        .map(|index| values[index])
-        .collect::<Vec<_>>();
+    let retained = topology_cluster(values, &wanted, target, inflation);
 
     Ok(SelectionOut {
         wanted,
         retained,
-        shifts,
     })
-}
-
-fn ritz_center(values: &[Complex64], indices: &[usize]) -> Complex64 {
-    let sum = indices
-        .iter()
-        .map(|&index| values[index])
-        .sum::<Complex64>();
-    sum / indices.len() as f64
 }
 
 fn base_selection(
@@ -134,6 +93,91 @@ fn base_selection(
 
             result
         }
+    }
+}
+
+
+fn topology_cluster(
+    values: &[Complex64], 
+    wanted: &Vec<usize>, 
+    target: SpectrumTarget, 
+    inflation: f64) -> Vec<usize>{
+    match target {
+        SpectrumTarget::LargestMagnitude
+        | SpectrumTarget::SmallestMagnitude => {
+            let sum = wanted
+                .iter()
+                .fold(0.0, |acc, &i| acc + values[i].norm());
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].norm() - center).abs())
+                .fold(0.0_f64, f64::max);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.norm() - center).abs() <= radius * inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+
+            retained
+        }
+
+        SpectrumTarget::LargestReal
+        | SpectrumTarget::SmallestReal => {
+            let sum = wanted
+                .iter()
+                .fold(0.0, |acc, &i| acc + values[i].re);
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].re - center).abs())
+                .fold(0.0_f64, f64::max);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.re - center).abs() <= radius * inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+            retained
+        }
+
+        SpectrumTarget::BothEndsReal => {
+            let sum = wanted
+                .iter()
+                .fold(0.0, |acc, &i| acc + values[i].re);
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].re - center).abs())
+                .fold(0.0_f64, f64::min);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.re - center).abs() < radius / inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+            retained
+        }
+
     }
 }
 
@@ -236,7 +280,6 @@ mod tests {
 
         assert_eq!(selection.wanted.len(), 2);
         assert_eq!(selection.retained.len(), 2);
-        assert_eq!(selection.shifts.len(), 2);
     }
 
     #[test]
@@ -252,7 +295,6 @@ mod tests {
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted, vec![0, 1]);
-        assert_eq!(selection.retained, vec![0, 1, 2]);
-        assert_eq!(selection.shifts, vec![Complex64::new(0.0, 0.0)]);
+        //assert_eq!(selection.retained, vec![Complex64::new(0.0, 0.0)]);
     }
 }

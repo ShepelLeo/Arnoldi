@@ -81,19 +81,19 @@ pub fn linear_combination3(
 }
 
 /// Ортогонализация вектора по базису
-pub fn orthogonalize_twice(
-    candidate: &mut Array1<Complex64>,
-    basis: &[Array1<Complex64>],
-    h_column: &mut [Complex64],
-) {
-    (0..2).for_each(|_| {
-        basis.iter().enumerate().for_each(|(index, basis_vector)| {
-            let projection = inner_product(basis_vector, candidate);
-            h_column[index] += projection;
-            axpy_in_place(candidate, -projection, basis_vector);
-        });
-    });
-}
+// pub fn orthogonalize_twice(
+//     candidate: &mut Array1<Complex64>,
+//     basis: &[Array1<Complex64>],
+//     h_column: &mut [Complex64],
+// ) {
+//     (0..2).for_each(|_| {
+//         basis.iter().enumerate().for_each(|(index, basis_vector)| {
+//             let projection = inner_product(basis_vector, candidate);
+//             h_column[index] += projection;
+//             axpy_in_place(candidate, -projection, basis_vector);
+//         });
+//     });
+// }
 
 // pub fn orthogonalize2_twice(
 //     candidate: &mut Array1<Complex64>,

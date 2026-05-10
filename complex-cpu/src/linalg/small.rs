@@ -13,7 +13,7 @@ pub struct RitzValue {
 }
 
 pub fn compute_ritz_values(hessenberg: &Array2<Complex64>) -> SchurOutput {
-    zhseqr_schur(hessenberg).unwrap()
+    zgees_schur(hessenberg).unwrap()
 }
 
 pub fn retrive_ritz_vectors(

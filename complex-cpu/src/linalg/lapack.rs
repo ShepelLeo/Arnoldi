@@ -25,6 +25,13 @@ pub struct SchurOutput {
 }
 
 #[derive(Debug)]
+pub struct HouseholderQrOutput {
+    pub q: Array2<Complex64>,
+    pub r: Array2<Complex64>,
+    pub rank: usize,
+}
+
+#[derive(Debug)]
 pub enum SchurError {
     NotSquare,
     BadIloIhi,
@@ -71,6 +78,26 @@ fn fortran_view<'a>(
 
 fn from_fortran_vec(rows: usize, cols: usize, data: Vec<Complex64>) -> Array2<Complex64> {
     Array2::from_shape_vec((rows, cols).f(), data).expect("invalid Fortran buffer shape")
+}
+
+fn copy_fortran_columns_to_array(
+    rows: usize,
+    cols: usize,
+    data: &[Complex64],
+) -> Array2<Complex64> {
+    let len = rows * cols;
+    assert!(
+        data.len() >= len,
+        "Fortran buffer has {} entries, expected at least {}",
+        data.len(),
+        len
+    );
+
+    let mut out = Array2::zeros((rows, cols).f());
+    out.as_slice_memory_order_mut()
+        .expect("Fortran-shaped Array2 must be contiguous")
+        .copy_from_slice(&data[..len]);
+    out
 }
 
 fn identity_fortran_vec(n: usize) -> Vec<Complex64> {
@@ -320,6 +347,77 @@ pub fn zhseqr_schur(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
     Ok(SchurOutput { w, t: h_col, z })
 }
 
+pub fn zgees_schur(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+    let (n, m) = a.dim();
+    if n != m {
+        return Err(SchurError::NotSquare);
+    }
+
+    if n == 0 {
+        return Ok(SchurOutput {
+            w: Vec::new(),
+            t: Vec::new(),
+            z: Vec::new(),
+        });
+    }
+
+    let n_i = n as i32;
+    let mut a_col = to_fortran_vec(a);
+    let mut w = vec![zero(); n];
+    let mut z = vec![zero(); n * n];
+    let mut rwork = vec![0.0; n];
+    let mut bwork = vec![0_i32; n];
+
+    let mut sdim = 0_i32;
+    let mut work_query = [zero(); 1];
+    let mut info = 0_i32;
+
+    unsafe {
+        lapack::zgees(
+            b'V',
+            b'N',
+            None,
+            n_i,
+            &mut a_col,
+            n_i,
+            &mut sdim,
+            &mut w,
+            &mut z,
+            n_i,
+            &mut work_query,
+            -1,
+            &mut rwork,
+            &mut bwork,
+            &mut info,
+        );
+    }
+
+    if info < 0 {
+        return Err(SchurError::LapackIllegalArgument(-info));
+    }
+
+    let lwork = (work_query[0].re as i32).max(2 * n_i).max(1);
+    let mut work = vec![zero(); lwork as usize];
+    let mut sdim = 0_i32;
+    let mut info = 0_i32;
+
+    unsafe {
+        lapack::zgees(
+            b'V', b'N', None, n_i, &mut a_col, n_i, &mut sdim, &mut w, &mut z, n_i, &mut work,
+            lwork, &mut rwork, &mut bwork, &mut info,
+        );
+    }
+
+    if info < 0 {
+        return Err(SchurError::LapackIllegalArgument(-info));
+    }
+    if info > 0 {
+        return Err(SchurError::NoConvergence(info));
+    }
+
+    Ok(SchurOutput { w, t: a_col, z })
+}
+
 pub fn ztrevc_right_selected(
     decomposition: &mut SchurOutput,
     indices: &[usize],
@@ -476,6 +574,115 @@ fn zgeqrf_q(matrix: &Array2<Complex64>) -> Result<Array2<Complex64>, String> {
     }
 
     Ok(from_fortran_vec(rows, cols, q))
+}
+
+pub fn zgeqrf_qr_rank(
+    matrix: &Array2<Complex64>,
+    relative_tolerance: f64,
+) -> Result<HouseholderQrOutput, String> {
+    let (rows, columns) = matrix.dim();
+    if rows < columns {
+        return Err(format!(
+            "thin QR expects rows >= columns, got {rows}x{columns}",
+        ));
+    }
+
+    if columns == 0 {
+        return Ok(HouseholderQrOutput {
+            q: Array2::zeros((rows, 0).f()),
+            r: Array2::zeros((0, 0).f()),
+            rank: 0,
+        });
+    }
+
+    let m = rows as i32;
+    let n = columns as i32;
+    let lda = m.max(1);
+    let min_mn = rows.min(columns);
+    let mut a = to_fortran_vec(matrix);
+    let mut tau = vec![zero(); min_mn];
+    let mut work_query = [zero(); 1];
+    let mut info = 0;
+
+    unsafe {
+        lapack::zgeqrf(m, n, &mut a, lda, &mut tau, &mut work_query, -1, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zgeqrf workspace query failed, info = {info}"));
+    }
+
+    let lwork = (work_query[0].re as i32).max(n).max(1);
+    let mut work = vec![zero(); lwork as usize];
+
+    unsafe {
+        lapack::zgeqrf(m, n, &mut a, lda, &mut tau, &mut work, lwork, &mut info);
+    }
+    if info != 0 {
+        return Err(format!("zgeqrf failed, info = {info}"));
+    }
+
+    let diagonal = (0..min_mn)
+        .map(|index| a[index + index * rows].norm())
+        .collect::<Vec<_>>();
+    let scale = diagonal.first().copied().unwrap_or(0.0);
+    let cutoff = relative_tolerance.max(0.0) * rows.max(columns) as f64 * scale;
+    let rank = if scale <= f64::EPSILON {
+        0
+    } else {
+        diagonal.iter().take_while(|&&value| value > cutoff).count()
+    };
+
+    let mut r = Array2::zeros((rank, columns).f());
+    for column in 0..columns {
+        let row_limit = rank.min(column + 1);
+        for row in 0..row_limit {
+            r[[row, column]] = a[row + column * rows];
+        }
+    }
+
+    if rank == 0 {
+        return Ok(HouseholderQrOutput {
+            q: Array2::zeros((rows, 0).f()),
+            r,
+            rank,
+        });
+    }
+
+    let q_columns = min_mn as i32;
+    work_query[0] = zero();
+    unsafe {
+        lapack::zungqr(
+            m,
+            q_columns,
+            q_columns,
+            &mut a,
+            lda,
+            &tau,
+            &mut work_query,
+            -1,
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return Err(format!("zungqr workspace query failed, info = {info}"));
+    }
+
+    let lwork = (work_query[0].re as i32).max(q_columns).max(1);
+    let mut work = vec![zero(); lwork as usize];
+    unsafe {
+        lapack::zungqr(
+            m, q_columns, q_columns, &mut a, lda, &tau, &mut work, lwork, &mut info,
+        );
+    }
+    if info != 0 {
+        return Err(format!("zungqr failed, info = {info}"));
+    }
+
+    Ok(HouseholderQrOutput {
+        q: copy_fortran_columns_to_array(rows, rank, &a),
+        r,
+        rank,
+    })
 }
 
 fn cleanup_hessenberg_roundoff(h: &mut Array2<Complex64>) {

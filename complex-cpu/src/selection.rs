@@ -41,10 +41,7 @@ pub fn select_ritz_values(
 
     let retained = topology_cluster(values, &wanted, target, inflation);
 
-    Ok(SelectionOut {
-        wanted,
-        retained,
-    })
+    Ok(SelectionOut { wanted, retained })
 }
 
 fn base_selection(
@@ -96,18 +93,15 @@ fn base_selection(
     }
 }
 
-
 fn topology_cluster(
-    values: &[Complex64], 
-    wanted: &Vec<usize>, 
-    target: SpectrumTarget, 
-    inflation: f64) -> Vec<usize>{
+    values: &[Complex64],
+    wanted: &Vec<usize>,
+    target: SpectrumTarget,
+    inflation: f64,
+) -> Vec<usize> {
     match target {
-        SpectrumTarget::LargestMagnitude
-        | SpectrumTarget::SmallestMagnitude => {
-            let sum = wanted
-                .iter()
-                .fold(0.0, |acc, &i| acc + values[i].norm());
+        SpectrumTarget::LargestMagnitude | SpectrumTarget::SmallestMagnitude => {
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].norm());
 
             let center = sum / wanted.len() as f64;
 
@@ -125,15 +119,11 @@ fn topology_cluster(
                 .map(|(i, _)| i)
                 .collect();
 
-
             retained
         }
 
-        SpectrumTarget::LargestReal
-        | SpectrumTarget::SmallestReal => {
-            let sum = wanted
-                .iter()
-                .fold(0.0, |acc, &i| acc + values[i].re);
+        SpectrumTarget::LargestReal | SpectrumTarget::SmallestReal => {
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].re);
 
             let center = sum / wanted.len() as f64;
 
@@ -155,9 +145,7 @@ fn topology_cluster(
         }
 
         SpectrumTarget::BothEndsReal => {
-            let sum = wanted
-                .iter()
-                .fold(0.0, |acc, &i| acc + values[i].re);
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].re);
 
             let center = sum / wanted.len() as f64;
 
@@ -171,13 +159,12 @@ fn topology_cluster(
             let retained: Vec<usize> = values
                 .iter()
                 .enumerate()
-                .filter(|(_, z)| (z.re - center).abs() < radius / inflation)
+                .filter(|(_, z)| (z.re - center).abs() > radius / inflation)
                 .map(|(i, _)| i)
                 .collect();
 
             retained
         }
-
     }
 }
 
@@ -279,7 +266,7 @@ mod tests {
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted.len(), 2);
-        assert_eq!(selection.retained.len(), 2);
+        assert_eq!(selection.retained.len(), 3);
     }
 
     #[test]

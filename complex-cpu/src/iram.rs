@@ -63,16 +63,23 @@ pub fn solve(
             config.ritz_inflation,
         )?;
 
-        let ritz_vectors = retrive_ritz_vectors(&mut hessenberg_schur, &selection.retained, krylov_dim);
+        let retained_indices = retained_indices_with_wanted(&selection.retained, &selection.wanted);
+        let retained_ritz_vectors =
+            retrive_ritz_vectors(&mut hessenberg_schur, &retained_indices, krylov_dim);
+        let retained_residual_estimates = retained_ritz_vectors
+            .row(krylov_dim - 1)
+            .iter()
+            .map(|entry| (trailing_subdiagonal * *entry).norm())
+            .collect::<Vec<_>>();
+        let wanted_positions = retained_positions(&retained_indices, &selection.wanted)?;
 
-        let result: Vec<RitzEstimate> = selection.wanted
+        let result: Vec<RitzEstimate> = selection
+            .wanted
             .iter()
             .enumerate()
             .map(|(i, &idx)| {
                 let value = hessenberg_schur.w[idx];
-
-                let residual_estimate =
-                    (trailing_subdiagonal * ritz_vectors[[krylov_dim - 1, i]]).norm();
+                let residual_estimate = retained_residual_estimates[wanted_positions[i]];
 
                 RitzEstimate {
                     value,
@@ -127,20 +134,17 @@ pub fn solve(
             .saturating_add(converged)
             .min(operator.dimension());
 
-        if selection.retained.is_empty() || selection.retained.len() >= target_steps {
-             note = Some("no room remains to extend the thick-restarted Krylov space".to_string());
-             break; // Беда
+        if retained_indices.is_empty() || retained_indices.len() >= target_steps {
+            note = Some("no room remains to extend the thick-restarted Krylov space".to_string());
+            break; // Беда
         }
-
-        let ritz_vectors =
-            retrive_ritz_vectors(&mut hessenberg_schur, &selection.retained, krylov_dim);
 
         // Запускаем рестарты
         factorization = thick_restart_and_extend(
             operator,
             &factorization,
             &square_hessenberg,
-            &ritz_vectors,
+            &retained_ritz_vectors,
             target_steps,
             config.breakdown_tol,
             &mut total_matvecs,
@@ -163,6 +167,25 @@ pub fn solve(
         history,
         note,
     })
+}
+
+fn retained_indices_with_wanted(retained: &[usize], wanted: &[usize]) -> Vec<usize> {
+    let mut indices = retained.to_vec();
+    indices.extend(wanted.iter().copied());
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn retained_positions(retained: &[usize], wanted: &[usize]) -> Result<Vec<usize>, IramError> {
+    wanted
+        .iter()
+        .map(|wanted_index| {
+            retained.binary_search(wanted_index).map_err(|_| {
+                IramError::Spectral("wanted Ritz value is absent from retained set".to_string())
+            })
+        })
+        .collect()
 }
 
 /// Вход в thick restart через Ritz-векторы малой задачи:

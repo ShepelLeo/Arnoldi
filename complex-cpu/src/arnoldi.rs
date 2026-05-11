@@ -187,6 +187,7 @@ mod tests {
         }
 
         let relation_error = frobenius_norm(&(applied - extended_basis.dot(&hessenberg)));
+        println!("{:?}", relation_error);
         assert!(relation_error < 1.0e-8, "relation_error={relation_error}");
 
         let gram = extended_basis

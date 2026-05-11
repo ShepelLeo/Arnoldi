@@ -68,6 +68,13 @@ impl SolverConfig {
             ));
         }
 
+        if self.block_size > self.nev {
+            return Err(IramError::InvalidConfig(format!(
+                "block_size ({}) should not exceed nev ({})",
+                self.block_size, self.nev,
+            )));
+        }
+
         if self.block_size > dimension {
             return Err(IramError::InvalidConfig(format!(
                 "block_size ({}) cannot exceed the operator dimension ({dimension})",
@@ -75,21 +82,39 @@ impl SolverConfig {
             )));
         }
 
-        if self.ncv == 0 {
-            return Err(IramError::InvalidConfig(
-                "ncv must be strictly positive".to_string(),
-            ));
+        if self.ncv < 2 {
+            return Err(IramError::InvalidConfig(format!(
+                "ncv ({}) must contain at least two Arnoldi blocks for restart",
+                self.ncv,
+            )));
         }
 
-        let krylov_capacity = self.ncv.checked_mul(self.block_size).ok_or_else(|| {
-            IramError::InvalidConfig("ncv * block_size overflows usize".to_string())
-        })?;
-
-        let effective_capacity = krylov_capacity.min(dimension);
-        if effective_capacity <= self.nev {
+        let restart_capacity = self
+            .ncv
+            .saturating_sub(1)
+            .checked_mul(self.block_size)
+            .ok_or_else(|| {
+                IramError::InvalidConfig("(ncv - 1) * block_size overflows usize".to_string())
+            })?;
+        if restart_capacity < self.nev {
             return Err(IramError::InvalidConfig(format!(
-                "min(ncv * block_size, dimension) ({effective_capacity}) must be larger than nev ({})",
-                self.nev,
+                "(ncv - 1) * block_size must be at least nev so restart can retain the wanted Ritz values, got ({} - 1) * {} = {} < {}",
+                self.ncv, self.block_size, restart_capacity, self.nev,
+            )));
+        }
+
+        let basis_blocks = self
+            .ncv
+            .checked_add(1)
+            .ok_or_else(|| IramError::InvalidConfig("ncv + 1 overflows usize".to_string()))?;
+        let extended_basis_dimension =
+            basis_blocks.checked_mul(self.block_size).ok_or_else(|| {
+                IramError::InvalidConfig("(ncv + 1) * block_size overflows usize".to_string())
+            })?;
+        if extended_basis_dimension > dimension {
+            return Err(IramError::InvalidConfig(format!(
+                "(ncv + 1) * block_size ({} * {} = {}) cannot exceed the operator dimension ({dimension})",
+                basis_blocks, self.block_size, extended_basis_dimension,
             )));
         }
 

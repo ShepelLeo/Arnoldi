@@ -48,14 +48,20 @@ impl SolveReport {
         writeln!(&mut output, "=======================").ok();
         writeln!(&mut output, "operator: {}", self.operator_description).ok();
         writeln!(&mut output, "dimension: {}", self.dimension).ok();
-        writeln!(&mut output, "start vector: {}", self.start_description).ok();
+        writeln!(&mut output, "start block: {}", self.start_description).ok();
         writeln!(&mut output, "target: {}", self.config.target).ok();
         writeln!(&mut output, "requested eigenvalues: {}", self.config.nev).ok();
-        writeln!(&mut output, "block size: {}", self.config.block_size).ok();
         writeln!(
             &mut output,
-            "Arnoldi block iterations (ncv): {}",
-            self.config.ncv
+            "initial block size: {}",
+            self.config.block_size
+        )
+        .ok();
+        writeln!(&mut output, "Arnoldi blocks (ncv): {}", self.config.ncv).ok();
+        writeln!(
+            &mut output,
+            "Arnoldi subspace dimension: {}",
+            self.config.ncv.saturating_mul(self.config.block_size)
         )
         .ok();
         writeln!(&mut output, "tolerance: {:.3e}", self.config.tol).ok();

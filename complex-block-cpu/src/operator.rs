@@ -8,7 +8,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMu
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::lapack::{ZgemmTranspose, ZgemvTranspose, zgemm_into, zgemv_into};
+use crate::linalg::ops::{ZgemmTranspose, ZgemvTranspose, matmul_into, matvec_into};
 
 /// Трейт линейных операторов
 pub trait LinearOperator: Send + Sync {
@@ -70,18 +70,18 @@ impl LinearOperator for IdentityOperator {
     fn apply_into(
         &self,
         vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
+        output: ArrayViewMut1<'_, Complex64>,
     ) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
-        output.assign(&vector);
+        copy_vector_into(output, vector);
         Ok(())
     }
 
     fn apply_block_into(
         &self,
         block: ArrayView2<'_, Complex64>,
-        mut output: ArrayViewMut2<'_, Complex64>,
+        output: ArrayViewMut2<'_, Complex64>,
     ) -> Result<(), IramError> {
         validate_dimension(self.dimension, block.nrows())?;
         validate_dimension(self.dimension, output.nrows())?;
@@ -91,7 +91,7 @@ impl LinearOperator for IdentityOperator {
                 got: output.ncols(),
             });
         }
-        output.assign(&block);
+        copy_matrix_into(output, block);
         Ok(())
     }
 
@@ -161,17 +161,19 @@ impl LinearOperator for GrcarOperator {
             });
         }
 
-        for row in 0..self.dimension {
-            let upper_end = (row + self.upper_bandwidth + 1).min(self.dimension);
-            for column in 0..block.ncols() {
-                let mut acc = block[[row, column]];
+        for column in 0..block.ncols() {
+            let input = block.column(column);
+            let mut target = output.column_mut(column);
+            for row in 0..self.dimension {
+                let upper_end = (row + self.upper_bandwidth + 1).min(self.dimension);
+                let mut acc = input[row];
                 if row > 0 {
-                    acc -= block[[row - 1, column]];
+                    acc -= input[row - 1];
                 }
                 for upper in (row + 1)..upper_end {
-                    acc += block[[upper, column]];
+                    acc += input[upper];
                 }
-                output[[row, column]] = acc;
+                target[row] = acc;
             }
         }
 
@@ -694,7 +696,7 @@ impl LinearOperator for DenseMatrixOperator {
     ) -> Result<(), IramError> {
         validate_dimension(self.dimension(), vector.len())?;
         validate_dimension(self.dimension(), output.len())?;
-        zgemv_into(
+        matvec_into(
             ZgemvTranspose::None,
             self.matrix.view(),
             Complex64::new(1.0, 0.0),
@@ -718,7 +720,7 @@ impl LinearOperator for DenseMatrixOperator {
                 got: output.ncols(),
             });
         }
-        zgemm_into(
+        matmul_into(
             ZgemmTranspose::None,
             ZgemmTranspose::None,
             Complex64::new(1.0, 0.0),
@@ -890,27 +892,29 @@ impl LinearOperator for ConvectionDiffusionOperator {
         let right_scale = Complex64::new(inv_h2 + conv, 0.0);
         let vertical_scale = Complex64::new(inv_h2, 0.0);
 
-        for j in 0..m {
-            let row_start = j * m;
-            for i in 0..m {
-                let k = row_start + i;
-                for column in 0..block.ncols() {
-                    let mut acc = block[[k, column]] * center_scale;
+        for column in 0..block.ncols() {
+            let input = block.column(column);
+            let mut target = output.column_mut(column);
+            for j in 0..m {
+                let row_start = j * m;
+                for i in 0..m {
+                    let k = row_start + i;
+                    let mut acc = input[k] * center_scale;
 
                     if i > 0 {
-                        acc += block[[k - 1, column]] * left_scale;
+                        acc += input[k - 1] * left_scale;
                     }
                     if i + 1 < m {
-                        acc += block[[k + 1, column]] * right_scale;
+                        acc += input[k + 1] * right_scale;
                     }
                     if j > 0 {
-                        acc += block[[k - m, column]] * vertical_scale;
+                        acc += input[k - m] * vertical_scale;
                     }
                     if j + 1 < m {
-                        acc += block[[k + m, column]] * vertical_scale;
+                        acc += input[k + m] * vertical_scale;
                     }
 
-                    output[[k, column]] = acc;
+                    target[k] = acc;
                 }
             }
         }
@@ -928,7 +932,7 @@ impl LinearOperator for ConvectionDiffusionOperator {
 
 pub struct FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: for<'a, 'b> Fn(ArrayView1<'a, Complex64>, ArrayViewMut1<'b, Complex64>) + Send + Sync,
 {
     dimension: usize,
     name: String,
@@ -937,7 +941,7 @@ where
 
 impl<F> FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: for<'a, 'b> Fn(ArrayView1<'a, Complex64>, ArrayViewMut1<'b, Complex64>) + Send + Sync,
 {
     pub fn new(dimension: usize, name: impl Into<String>, matvec: F) -> Self {
         Self {
@@ -950,7 +954,7 @@ where
 
 impl<F> fmt::Debug for FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: for<'a, 'b> Fn(ArrayView1<'a, Complex64>, ArrayViewMut1<'b, Complex64>) + Send + Sync,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -963,7 +967,7 @@ where
 
 impl<F> LinearOperator for FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: for<'a, 'b> Fn(ArrayView1<'a, Complex64>, ArrayViewMut1<'b, Complex64>) + Send + Sync,
 {
     fn dimension(&self) -> usize {
         self.dimension
@@ -972,24 +976,43 @@ where
     fn apply_into(
         &self,
         vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
+        output: ArrayViewMut1<'_, Complex64>,
     ) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
-        let result = (self.matvec)(&vector.to_owned());
-        validate_dimension(self.dimension, result.len())?;
-        output.assign(&result);
+        (self.matvec)(vector, output);
         Ok(())
-    }
-
-    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
-        validate_dimension(self.dimension, vector.len())?;
-        Ok((self.matvec)(vector))
     }
 
     fn description(&self) -> String {
         self.name.clone()
     }
+}
+
+fn copy_vector_into(mut output: ArrayViewMut1<'_, Complex64>, input: ArrayView1<'_, Complex64>) {
+    assert_eq!(output.len(), input.len());
+    if let (Some(output_slice), Some(input_slice)) = (
+        output.as_slice_memory_order_mut(),
+        input.as_slice_memory_order(),
+    ) {
+        output_slice.copy_from_slice(input_slice);
+        return;
+    }
+
+    output.zip_mut_with(&input, |target, value| *target = *value);
+}
+
+fn copy_matrix_into(mut output: ArrayViewMut2<'_, Complex64>, input: ArrayView2<'_, Complex64>) {
+    assert_eq!(output.dim(), input.dim());
+    if let (Some(output_slice), Some(input_slice)) = (
+        output.as_slice_memory_order_mut(),
+        input.as_slice_memory_order(),
+    ) {
+        output_slice.copy_from_slice(input_slice);
+        return;
+    }
+
+    output.zip_mut_with(&input, |target, value| *target = *value);
 }
 
 pub fn parse_complex_token(entry: &str) -> Result<Complex64, IramError> {

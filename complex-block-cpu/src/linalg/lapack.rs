@@ -1,35 +1,33 @@
 use ndarray::{Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder};
 use num_complex::Complex64;
+use std::fmt;
 use std::os::raw::{c_char, c_int};
 
 #[derive(Debug, Clone, Copy)]
-pub enum ZgemvTranspose {
+pub(crate) enum ZgemvTranspose {
     None,
-    ConjugateTranspose,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ZgemmTranspose {
+pub(crate) enum ZgemmTranspose {
     None,
     ConjugateTranspose,
 }
 
 #[derive(Debug)]
-pub struct QrOutput {
+pub(crate) struct QrOutput {
     pub q: Array2<Complex64>,
     pub r: Array2<Complex64>,
 }
 
 #[derive(Debug)]
-pub struct PivotedQrOutput {
+pub(crate) struct PivotedQrOutput {
     pub q: Array2<Complex64>,
-    pub r: Array2<Complex64>,
-    pub pivots: Vec<usize>,
     pub rank: usize,
 }
 
 #[derive(Debug)]
-pub struct SchurOutput {
+pub(crate) struct SchurOutput {
     /// Eigenvalues.
     pub w: Vec<Complex64>,
     /// Schur form T in LAPACK/Fortran column-major layout.
@@ -39,7 +37,7 @@ pub struct SchurOutput {
 }
 
 #[derive(Debug)]
-pub enum SchurError {
+pub(crate) enum SchurError {
     NotSquare,
     LapackIllegalArgument(i32),
     NoConvergence(i32),
@@ -47,8 +45,27 @@ pub enum SchurError {
     InvalidEigenIndex(usize),
 }
 
+impl fmt::Display for SchurError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSquare => write!(formatter, "Schur decomposition expects a square matrix"),
+            Self::LapackIllegalArgument(argument) => {
+                write!(formatter, "LAPACK rejected argument {argument}")
+            }
+            Self::NoConvergence(info) => {
+                write!(
+                    formatter,
+                    "Schur decomposition did not converge, info = {info}"
+                )
+            }
+            Self::DimensionMismatch => write!(formatter, "matrix dimension mismatch"),
+            Self::InvalidEigenIndex(index) => write!(formatter, "invalid eigenvalue index {index}"),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
-pub struct HouseholderQrWorkspace {
+pub(crate) struct HouseholderQrWorkspace {
     a: Vec<Complex64>,
     tau: Vec<Complex64>,
     work: Vec<Complex64>,
@@ -57,7 +74,7 @@ pub struct HouseholderQrWorkspace {
 }
 
 #[derive(Debug, Default)]
-pub struct PivotedQrWorkspace {
+pub(crate) struct PivotedQrWorkspace {
     a: Vec<Complex64>,
     jpvt: Vec<i32>,
     tau: Vec<Complex64>,
@@ -68,7 +85,7 @@ pub struct PivotedQrWorkspace {
 }
 
 #[derive(Debug, Default)]
-pub struct DenseSchurWorkspace {
+pub(crate) struct DenseSchurWorkspace {
     a: Vec<Complex64>,
     w: Vec<Complex64>,
     z: Vec<Complex64>,
@@ -79,7 +96,7 @@ pub struct DenseSchurWorkspace {
 }
 
 #[derive(Debug, Default)]
-pub struct TrevcWorkspace {
+pub(crate) struct TrevcWorkspace {
     select: Vec<i32>,
     vr_selected: Vec<Complex64>,
     work: Vec<Complex64>,
@@ -125,6 +142,50 @@ fn view_to_fortran_vec(a: ArrayView2<'_, Complex64>) -> Vec<Complex64> {
     out
 }
 
+fn copy_view_to_fortran_buffer(a: ArrayView2<'_, Complex64>, out: &mut Vec<Complex64>) {
+    let (rows, cols) = a.dim();
+    let len = rows * cols;
+    out.clear();
+
+    let strides = a.strides();
+    let compact_fortran =
+        (rows <= 1 || strides[0] == 1) && (cols <= 1 || strides[1] == rows as isize);
+    if compact_fortran && let Some(slice) = a.as_slice_memory_order() {
+        out.extend_from_slice(slice);
+        return;
+    }
+
+    out.resize(len, zero());
+    for column in 0..cols {
+        let offset = column * rows;
+        for row in 0..rows {
+            out[offset + row] = a[(row, column)];
+        }
+    }
+}
+
+fn move_array_to_fortran_buffer(a: Array2<Complex64>, out: &mut Vec<Complex64>) {
+    let (rows, cols) = a.dim();
+    let len = rows * cols;
+    let strides = a.strides();
+    let compact_fortran =
+        (rows <= 1 || strides[0] == 1) && (cols <= 1 || strides[1] == rows as isize);
+
+    if compact_fortran && a.as_slice_memory_order().is_some() {
+        let (data, offset) = a.into_raw_vec_and_offset();
+        let offset = offset.unwrap_or(0);
+        if offset == 0 && data.len() == len {
+            *out = data;
+        } else {
+            out.clear();
+            out.extend_from_slice(&data[offset..offset + len]);
+        }
+        return;
+    }
+
+    copy_view_to_fortran_buffer(a.view(), out);
+}
+
 #[inline]
 fn fortran_view<'a>(
     rows: usize,
@@ -138,8 +199,24 @@ fn fortran_view<'a>(
     ArrayView2::from_shape((rows, cols).f(), data).map_err(|_| SchurError::DimensionMismatch)
 }
 
-fn copy_fortran_slice_to_array(rows: usize, cols: usize, data: &[Complex64]) -> Array2<Complex64> {
-    Array2::from_shape_fn((rows, cols).f(), |(row, column)| data[row + column * rows])
+fn copy_fortran_columns_to_array(
+    rows: usize,
+    cols: usize,
+    data: &[Complex64],
+) -> Array2<Complex64> {
+    let len = rows * cols;
+    assert!(
+        data.len() >= len,
+        "Fortran buffer has {} entries, expected at least {}",
+        data.len(),
+        len
+    );
+
+    let mut out = Array2::zeros((rows, cols).f());
+    out.as_slice_memory_order_mut()
+        .expect("Fortran-shaped Array2 must be contiguous")
+        .copy_from_slice(&data[..len]);
+    out
 }
 
 enum BlasInput {
@@ -188,6 +265,19 @@ fn output_is_column_major(output: &ArrayViewMut2<'_, Complex64>) -> bool {
     (rows <= 1 || strides[0] == 1) && strides[1] > 0
 }
 
+fn copy_view_into_view(mut output: ArrayViewMut2<'_, Complex64>, input: ArrayView2<'_, Complex64>) {
+    assert_eq!(output.dim(), input.dim());
+    if let (Some(output_slice), Some(input_slice)) = (
+        output.as_slice_memory_order_mut(),
+        input.as_slice_memory_order(),
+    ) {
+        output_slice.copy_from_slice(input_slice);
+        return;
+    }
+
+    output.zip_mut_with(&input, |target, value| *target = *value);
+}
+
 unsafe extern "C" {
     fn zgemv_(
         trans: *const c_char,
@@ -220,7 +310,7 @@ unsafe extern "C" {
     );
 }
 
-pub fn zgemv(
+pub(crate) fn zgemv(
     trans: ZgemvTranspose,
     matrix: ArrayView2<'_, Complex64>,
     alpha: Complex64,
@@ -244,7 +334,6 @@ pub fn zgemv(
 
     let (trans_char, x_len, y_len) = match trans {
         ZgemvTranspose::None => (b'N' as c_char, columns, rows),
-        ZgemvTranspose::ConjugateTranspose => (b'C' as c_char, rows, columns),
     };
     assert_eq!(x.len(), x_len);
     assert_eq!(y.len(), y_len);
@@ -272,7 +361,7 @@ pub fn zgemv(
     }
 }
 
-pub fn zgemv_into(
+pub(crate) fn zgemv_into(
     trans: ZgemvTranspose,
     matrix: ArrayView2<'_, Complex64>,
     alpha: Complex64,
@@ -283,7 +372,6 @@ pub fn zgemv_into(
     let (rows, columns) = matrix.dim();
     let (x_len, y_len) = match trans {
         ZgemvTranspose::None => (columns, rows),
-        ZgemvTranspose::ConjugateTranspose => (rows, columns),
     };
     assert_eq!(x.len(), x_len);
     assert_eq!(y.len(), y_len);
@@ -303,50 +391,12 @@ pub fn zgemv_into(
     }
 }
 
-/// BLAS ZGEMM: плотное матричное умножение комплексных матриц в column-major буферах.
-pub fn zgemm(
-    trans_a: ZgemmTranspose,
-    trans_b: ZgemmTranspose,
-    left: ArrayView2<'_, Complex64>,
-    right: ArrayView2<'_, Complex64>,
-) -> Array2<Complex64> {
-    let (left_rows, left_cols) = left.dim();
-    let (right_rows, right_cols) = right.dim();
-
-    let (m, k_left) = match trans_a {
-        ZgemmTranspose::None => (left_rows, left_cols),
-        ZgemmTranspose::ConjugateTranspose => (left_cols, left_rows),
-    };
-    let (k_right, n) = match trans_b {
-        ZgemmTranspose::None => (right_rows, right_cols),
-        ZgemmTranspose::ConjugateTranspose => (right_cols, right_rows),
-    };
-
-    assert_eq!(
-        k_left, k_right,
-        "zgemm dimension mismatch: left inner dimension {} != right inner dimension {}",
-        k_left, k_right,
-    );
-
-    let mut output = Array2::zeros((m, n).f());
-    zgemm_into(
-        trans_a,
-        trans_b,
-        Complex64::new(1.0, 0.0),
-        left,
-        right,
-        Complex64::ZERO,
-        output.view_mut(),
-    );
-    output
-}
-
 /// BLAS ZGEMM: C := alpha * op(A) * op(B) + beta * C.
 ///
 /// Column-major ndarray views are passed directly to BLAS, including full-row
 /// slices with a larger leading dimension. Non-column-major inputs fall back to
 /// one temporary Fortran copy; non-column-major outputs use one temporary result.
-pub fn zgemm_into(
+pub(crate) fn zgemm_into(
     trans_a: ZgemmTranspose,
     trans_b: ZgemmTranspose,
     alpha: Complex64,
@@ -397,9 +447,9 @@ pub fn zgemm_into(
 
     if !output_is_column_major(&output) {
         let mut temp = Array2::zeros((m, n).f());
-        temp.assign(&output);
+        copy_view_into_view(temp.view_mut(), output.view());
         zgemm_into(trans_a, trans_b, alpha, left, right, beta, temp.view_mut());
-        output.assign(&temp);
+        copy_view_into_view(output, temp.view());
         return;
     }
 
@@ -434,10 +484,11 @@ pub fn zgemm_into(
 
 impl HouseholderQrWorkspace {
     fn zgeqrf_lwork(&mut self, m: i32, n: i32, lda: i32) -> Result<i32, String> {
-        if let Some(cache) = self.zgeqrf_work {
-            if cache.m == m && cache.n == n {
-                return Ok(cache.lwork);
-            }
+        if let Some(cache) = self.zgeqrf_work
+            && cache.m == m
+            && cache.n == n
+        {
+            return Ok(cache.lwork);
         }
 
         let mut work_query = [zero(); 1];
@@ -464,10 +515,12 @@ impl HouseholderQrWorkspace {
     }
 
     fn zungqr_lwork(&mut self, m: i32, n: i32, k: i32, lda: i32) -> Result<i32, String> {
-        if let Some(cache) = self.zungqr_work {
-            if cache.m == m && cache.n == n && cache.k == k {
-                return Ok(cache.lwork);
-            }
+        if let Some(cache) = self.zungqr_work
+            && cache.m == m
+            && cache.n == n
+            && cache.k == k
+        {
+            return Ok(cache.lwork);
         }
 
         let mut work_query = [zero(); 1];
@@ -494,8 +547,7 @@ impl HouseholderQrWorkspace {
         Ok(lwork)
     }
 
-    fn compute_thin_qr(&mut self, matrix: &Array2<Complex64>) -> Result<QrOutput, String> {
-        let (rows, columns) = matrix.dim();
+    fn finish_thin_qr(&mut self, rows: usize, columns: usize) -> Result<QrOutput, String> {
         if rows < columns {
             return Err(format!(
                 "thin QR expects rows >= columns, got {rows}x{columns}",
@@ -512,8 +564,6 @@ impl HouseholderQrWorkspace {
         let m = rows as i32;
         let n = columns as i32;
         let lda = m.max(1);
-        self.a.clear();
-        self.a.extend(view_to_fortran_vec(matrix.view()));
         self.tau.resize(columns, zero());
 
         let lwork = self.zgeqrf_lwork(m, n, lda)?;
@@ -562,31 +612,74 @@ impl HouseholderQrWorkspace {
         }
 
         Ok(QrOutput {
-            q: copy_fortran_slice_to_array(rows, columns, &self.a),
+            q: copy_fortran_columns_to_array(rows, columns, &self.a),
             r,
         })
     }
+
+    fn compute_thin_qr(&mut self, matrix: ArrayView2<'_, Complex64>) -> Result<QrOutput, String> {
+        let (rows, columns) = matrix.dim();
+        if rows < columns {
+            return Err(format!(
+                "thin QR expects rows >= columns, got {rows}x{columns}",
+            ));
+        }
+
+        if columns == 0 {
+            return Ok(QrOutput {
+                q: Array2::zeros((rows, 0).f()),
+                r: Array2::zeros((0, 0).f()),
+            });
+        }
+
+        copy_view_to_fortran_buffer(matrix, &mut self.a);
+        self.finish_thin_qr(rows, columns)
+    }
+
+    fn compute_thin_qr_owned_fortran(
+        &mut self,
+        matrix: Array2<Complex64>,
+    ) -> Result<QrOutput, String> {
+        let (rows, columns) = matrix.dim();
+        if rows < columns {
+            return Err(format!(
+                "thin QR expects rows >= columns, got {rows}x{columns}",
+            ));
+        }
+
+        if columns == 0 {
+            return Ok(QrOutput {
+                q: Array2::zeros((rows, 0).f()),
+                r: Array2::zeros((0, 0).f()),
+            });
+        }
+
+        move_array_to_fortran_buffer(matrix, &mut self.a);
+        self.finish_thin_qr(rows, columns)
+    }
 }
 
-/// LAPACK ZGEQRF + ZUNGQR: тонкое Householder QR-разложение A = Q R.
-pub fn zgeqrf_qr(matrix: &Array2<Complex64>) -> Result<QrOutput, String> {
-    let mut workspace = HouseholderQrWorkspace::default();
-    zgeqrf_qr_with_workspace(matrix, &mut workspace)
-}
-
-pub fn zgeqrf_qr_with_workspace(
-    matrix: &Array2<Complex64>,
+pub(crate) fn zgeqrf_qr_with_workspace(
+    matrix: ArrayView2<'_, Complex64>,
     workspace: &mut HouseholderQrWorkspace,
 ) -> Result<QrOutput, String> {
     workspace.compute_thin_qr(matrix)
 }
 
+pub(crate) fn zgeqrf_qr_owned_fortran_with_workspace(
+    matrix: Array2<Complex64>,
+    workspace: &mut HouseholderQrWorkspace,
+) -> Result<QrOutput, String> {
+    workspace.compute_thin_qr_owned_fortran(matrix)
+}
+
 impl PivotedQrWorkspace {
     fn zgeqp3_lwork(&mut self, m: i32, n: i32, lda: i32) -> Result<i32, String> {
-        if let Some(cache) = self.zgeqp3_work {
-            if cache.m == m && cache.n == n {
-                return Ok(cache.lwork);
-            }
+        if let Some(cache) = self.zgeqp3_work
+            && cache.m == m
+            && cache.n == n
+        {
+            return Ok(cache.lwork);
         }
 
         let mut work_query = [zero(); 1];
@@ -615,10 +708,12 @@ impl PivotedQrWorkspace {
     }
 
     fn zungqr_lwork(&mut self, m: i32, n: i32, k: i32, lda: i32) -> Result<i32, String> {
-        if let Some(cache) = self.zungqr_work {
-            if cache.m == m && cache.n == n && cache.k == k {
-                return Ok(cache.lwork);
-            }
+        if let Some(cache) = self.zungqr_work
+            && cache.m == m
+            && cache.n == n
+            && cache.k == k
+        {
+            return Ok(cache.lwork);
         }
 
         let mut work_query = [zero(); 1];
@@ -645,12 +740,12 @@ impl PivotedQrWorkspace {
         Ok(lwork)
     }
 
-    fn compute_rank_revealing_qr(
+    fn finish_rank_revealing_qr(
         &mut self,
-        matrix: &Array2<Complex64>,
+        rows: usize,
+        columns: usize,
         relative_tolerance: f64,
     ) -> Result<PivotedQrOutput, String> {
-        let (rows, columns) = matrix.dim();
         if rows < columns {
             return Err(format!(
                 "pivoted thin QR expects rows >= columns, got {rows}x{columns}",
@@ -660,8 +755,6 @@ impl PivotedQrWorkspace {
         if columns == 0 {
             return Ok(PivotedQrOutput {
                 q: Array2::zeros((rows, 0).f()),
-                r: Array2::zeros((0, 0).f()),
-                pivots: Vec::new(),
                 rank: 0,
             });
         }
@@ -670,8 +763,6 @@ impl PivotedQrWorkspace {
         let n = columns as i32;
         let lda = m.max(1);
         let min_mn = rows.min(columns);
-        self.a.clear();
-        self.a.extend(view_to_fortran_vec(matrix.view()));
         self.jpvt.resize(columns, 0);
         self.jpvt.fill(0);
         self.tau.resize(min_mn, zero());
@@ -710,30 +801,9 @@ impl PivotedQrWorkspace {
             diagonal.iter().take_while(|&&value| value > cutoff).count()
         };
 
-        let mut r = Array2::zeros((rank, columns).f());
-        for column in 0..columns {
-            let row_limit = rank.min(column + 1);
-            for row in 0..row_limit {
-                r[[row, column]] = self.a[row + column * rows];
-            }
-        }
-
-        let pivots = self
-            .jpvt
-            .iter()
-            .map(|&pivot| {
-                usize::try_from(pivot)
-                    .ok()
-                    .and_then(|value| value.checked_sub(1))
-                    .unwrap_or(0)
-            })
-            .collect::<Vec<_>>();
-
         if rank == 0 {
             return Ok(PivotedQrOutput {
                 q: Array2::zeros((rows, 0).f()),
-                r,
-                pivots,
                 rank,
             });
         }
@@ -758,27 +828,34 @@ impl PivotedQrWorkspace {
             return Err(format!("zungqr failed, info = {info}"));
         }
 
-        let q_full = copy_fortran_slice_to_array(rows, min_mn, &self.a);
         Ok(PivotedQrOutput {
-            q: q_full.slice(ndarray::s![.., 0..rank]).to_owned(),
-            r,
-            pivots,
+            q: copy_fortran_columns_to_array(rows, rank, &self.a),
             rank,
         })
+    }
+
+    fn compute_rank_revealing_qr(
+        &mut self,
+        matrix: ArrayView2<'_, Complex64>,
+        relative_tolerance: f64,
+    ) -> Result<PivotedQrOutput, String> {
+        let (rows, columns) = matrix.dim();
+        copy_view_to_fortran_buffer(matrix, &mut self.a);
+        self.finish_rank_revealing_qr(rows, columns, relative_tolerance)
     }
 }
 
 /// LAPACK ZGEQP3 + ZUNGQR: rank-revealing QR с перестановкой столбцов.
-pub fn zgeqp3_qr_rank(
+pub(crate) fn zgeqp3_qr_rank(
     matrix: &Array2<Complex64>,
     relative_tolerance: f64,
 ) -> Result<PivotedQrOutput, String> {
     let mut workspace = PivotedQrWorkspace::default();
-    zgeqp3_qr_rank_with_workspace(matrix, relative_tolerance, &mut workspace)
+    zgeqp3_qr_rank_with_workspace(matrix.view(), relative_tolerance, &mut workspace)
 }
 
-pub fn zgeqp3_qr_rank_with_workspace(
-    matrix: &Array2<Complex64>,
+pub(crate) fn zgeqp3_qr_rank_with_workspace(
+    matrix: ArrayView2<'_, Complex64>,
     relative_tolerance: f64,
     workspace: &mut PivotedQrWorkspace,
 ) -> Result<PivotedQrOutput, String> {
@@ -786,11 +863,17 @@ pub fn zgeqp3_qr_rank_with_workspace(
 }
 
 impl DenseSchurWorkspace {
+    pub(crate) fn recycle_schur_output(&mut self, mut output: SchurOutput) {
+        self.w = std::mem::take(&mut output.w);
+        self.a = std::mem::take(&mut output.t);
+        self.z = std::mem::take(&mut output.z);
+    }
+
     fn zgees_lwork(&mut self, n: i32) -> Result<i32, SchurError> {
-        if let Some(cache) = self.zgees_work {
-            if cache.n == n {
-                return Ok(cache.lwork);
-            }
+        if let Some(cache) = self.zgees_work
+            && cache.n == n
+        {
+            return Ok(cache.lwork);
         }
 
         let mut sdim = 0_i32;
@@ -825,7 +908,10 @@ impl DenseSchurWorkspace {
         Ok(lwork)
     }
 
-    fn compute_schur(&mut self, matrix: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+    fn compute_schur(
+        &mut self,
+        matrix: ArrayView2<'_, Complex64>,
+    ) -> Result<SchurOutput, SchurError> {
         let (n, m) = matrix.dim();
         if n != m {
             return Err(SchurError::NotSquare);
@@ -840,8 +926,7 @@ impl DenseSchurWorkspace {
         }
 
         let n_i = n as i32;
-        self.a.clear();
-        self.a.extend(view_to_fortran_vec(matrix.view()));
+        copy_view_to_fortran_buffer(matrix, &mut self.a);
         self.w.resize(n, zero());
         self.z.resize(n * n, zero());
         self.rwork.resize(n, 0.0);
@@ -880,35 +965,21 @@ impl DenseSchurWorkspace {
         }
 
         Ok(SchurOutput {
-            w: self.w.clone(),
-            t: self.a.clone(),
-            z: self.z.clone(),
+            w: std::mem::take(&mut self.w),
+            t: std::mem::take(&mut self.a),
+            z: std::mem::take(&mut self.z),
         })
     }
 }
 
-pub fn zgees_schur(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
-    let mut workspace = DenseSchurWorkspace::default();
-    zgees_schur_with_workspace(a, &mut workspace)
-}
-
-pub fn zgees_schur_with_workspace(
-    a: &Array2<Complex64>,
+pub(crate) fn zgees_schur_with_workspace(
+    a: ArrayView2<'_, Complex64>,
     workspace: &mut DenseSchurWorkspace,
 ) -> Result<SchurOutput, SchurError> {
     workspace.compute_schur(a)
 }
 
-pub fn ztrevc_right_selected(
-    decomposition: &mut SchurOutput,
-    indices: &[usize],
-    dim: usize,
-) -> Result<Array2<Complex64>, SchurError> {
-    let mut workspace = TrevcWorkspace::default();
-    ztrevc_right_selected_with_workspace(decomposition, indices, dim, &mut workspace)
-}
-
-pub fn ztrevc_right_selected_with_workspace(
+pub(crate) fn ztrevc_right_selected_with_workspace(
     decomposition: &mut SchurOutput,
     indices: &[usize],
     dim: usize,
@@ -970,8 +1041,17 @@ pub fn ztrevc_right_selected_with_workspace(
     let x_sel = fortran_view(dim, m_out as usize, &workspace.vr_selected)?;
     let z = fortran_view(dim, dim, &decomposition.z)?;
 
-    // Единственная новая матрица здесь — результат Z * X; считаем его через BLAS.
-    Ok(zgemm(ZgemmTranspose::None, ZgemmTranspose::None, z, x_sel))
+    let mut vectors = Array2::zeros((dim, m_out as usize).f());
+    zgemm_into(
+        ZgemmTranspose::None,
+        ZgemmTranspose::None,
+        Complex64::ONE,
+        z,
+        x_sel,
+        Complex64::ZERO,
+        vectors.view_mut(),
+    );
+    Ok(vectors)
 }
 
 #[cfg(test)]
@@ -1001,21 +1081,6 @@ mod tests {
         assert_eq!(
             y,
             vec![Complex64::new(17.0, 0.0), Complex64::new(39.0, 0.0)]
-        );
-
-        let x = vec![Complex64::new(7.0, 0.0), Complex64::new(11.0, 0.0)];
-        let mut y = vec![Complex64::ZERO; 2];
-        zgemv(
-            ZgemvTranspose::ConjugateTranspose,
-            a.view(),
-            one,
-            &x,
-            zero,
-            &mut y,
-        );
-        assert_eq!(
-            y,
-            vec![Complex64::new(40.0, 0.0), Complex64::new(58.0, 0.0)]
         );
     }
 
@@ -1067,11 +1132,15 @@ mod tests {
         )
         .unwrap();
 
-        let product = zgemm(
+        let mut product = Array2::zeros((2, 2).f());
+        zgemm_into(
             ZgemmTranspose::None,
             ZgemmTranspose::None,
+            Complex64::ONE,
             a.view(),
             b.view(),
+            Complex64::ZERO,
+            product.view_mut(),
         );
         assert_eq!(
             product,
@@ -1087,11 +1156,15 @@ mod tests {
             .unwrap(),
         );
 
-        let gram = zgemm(
+        let mut gram = Array2::zeros((2, 2).f());
+        zgemm_into(
             ZgemmTranspose::ConjugateTranspose,
             ZgemmTranspose::None,
+            Complex64::ONE,
             a.view(),
             a.view(),
+            Complex64::ZERO,
+            gram.view_mut(),
         );
         assert_eq!(
             gram,
@@ -1115,18 +1188,19 @@ mod tests {
             [Complex64::new(3.0, 0.0), Complex64::new(4.0, 0.0)],
         ];
 
-        let out = zgees_schur(&a).unwrap();
+        let mut workspace = DenseSchurWorkspace::default();
+        let out = zgees_schur_with_workspace(a.view(), &mut workspace).unwrap();
 
         assert_eq!(out.w.len(), 2);
         assert!(
             out.w
                 .iter()
-                .any(|value| (value - Complex64::new(-0.3722813232690143, 0.0)).norm() < 1.0e-12)
+                .any(|value| (*value - Complex64::new(-0.3722813232690143, 0.0)).norm() < 1.0e-12)
         );
         assert!(
             out.w
                 .iter()
-                .any(|value| (value - Complex64::new(5.372281323269014, 0.0)).norm() < 1.0e-12)
+                .any(|value| (*value - Complex64::new(5.372281323269014, 0.0)).norm() < 1.0e-12)
         );
     }
 
@@ -1136,9 +1210,49 @@ mod tests {
             [Complex64::new(1.0, 0.0), Complex64::new(2.0, 0.0)],
             [Complex64::new(3.0, 0.0), Complex64::new(4.0, 0.0)],
         ];
-        let mut schur = zgees_schur(&a).unwrap();
-        let vectors = ztrevc_right_selected(&mut schur, &[0], 2).unwrap();
+        let mut schur_workspace = DenseSchurWorkspace::default();
+        let mut schur = zgees_schur_with_workspace(a.view(), &mut schur_workspace).unwrap();
+        let mut trevc_workspace = TrevcWorkspace::default();
+        let vectors =
+            ztrevc_right_selected_with_workspace(&mut schur, &[0], 2, &mut trevc_workspace)
+                .unwrap();
 
         assert_eq!(vectors.dim(), (2, 1));
+    }
+
+    #[test]
+    fn ztrevc_selected_vectors_are_returned_in_schur_index_order() {
+        let dim = 4;
+        let mut t = vec![Complex64::ZERO; dim * dim];
+        let mut z = vec![Complex64::ZERO; dim * dim];
+        let mut w = Vec::with_capacity(dim);
+
+        for index in 0..dim {
+            let value = Complex64::new((index + 1) as f64, 0.0);
+            t[index + index * dim] = value;
+            z[index + index * dim] = Complex64::new(1.0, 0.0);
+            w.push(value);
+        }
+
+        let mut schur = SchurOutput { w, t, z };
+        let mut workspace = TrevcWorkspace::default();
+        let vectors =
+            ztrevc_right_selected_with_workspace(&mut schur, &[3, 1], dim, &mut workspace).unwrap();
+        let expected = Array2::from_shape_vec(
+            (dim, 2).f(),
+            vec![
+                Complex64::ZERO,
+                Complex64::new(1.0, 0.0),
+                Complex64::ZERO,
+                Complex64::ZERO,
+                Complex64::ZERO,
+                Complex64::ZERO,
+                Complex64::ZERO,
+                Complex64::new(1.0, 0.0),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(vectors, expected);
     }
 }

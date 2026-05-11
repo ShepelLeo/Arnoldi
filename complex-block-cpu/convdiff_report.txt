@@ -2,61 +2,170 @@ IRAM convergence report
 =======================
 operator: Matrix Market matrix loaded from matrices/rw5151.mtx
 dimension: 5151
-start vector: random orthonormal block 5151x4 with seed 0
+start block: random orthonormal block 5151x10 with seed 0
 target: largest magnitude
-requested eigenvalues: 4
-block size: 4
-Arnoldi block iterations (ncv): 100
-tolerance: 1.000e-16
+requested eigenvalues: 10
+initial block size: 10
+Arnoldi blocks (ncv): 50
+Arnoldi subspace dimension: 500
+tolerance: 1.000e-14
 Ritz selection inflation: 1.000e0
 max restarts: 1000
 
 summary
 -------
-converged eigenvalues: 4 / 4
-elapsed wall-clock time: 9.851186 s
-restart cycles: 6
-matvec operations: 3667
-peak tracked heap memory: 300224400 bytes (286.316 MiB)
+converged eigenvalues: 10 / 10
+elapsed wall-clock time: 7.859619 s
+restart cycles: 12
+matvec operations: 5680
+peak tracked heap memory: 110393664 bytes (105.280 MiB)
 happy breakdown: no
 fully converged: yes
 
 final Ritz values
 -----------------
- 1. lambda =         1.000000000000e0 | residual estimate = 4.506e-26
- 2. lambda = 9.759657299717e-1 +9.976510441968e-3i | residual estimate = 1.871e-27
- 3. lambda = 9.759657299694e-1 -9.976510439290e-3i | residual estimate = 9.449e-24
- 4. lambda = 9.725569701401e-1 +7.805070845676e-12i | residual estimate = 1.199e-23
+ 1. lambda =         1.000000000000e0 | residual estimate = 0.000e0
+ 2. lambda = 9.759657299719e-1 +9.976510438524e-3i | residual estimate = 1.903e-15
+ 3. lambda = 9.759657299813e-1 -9.976510427903e-3i | residual estimate = 1.739e-15
+ 4. lambda = 9.725569704101e-1 -9.202897201209e-10i | residual estimate = 1.501e-15
+ 5. lambda = 9.697661631692e-1 +4.764069956895e-9i | residual estimate = 1.605e-15
+ 6. lambda = 9.652329599279e-1 -1.744509967263e-8i | residual estimate = 1.739e-15
+ 7. lambda = 9.576920064002e-1 +1.784019581103e-2i | residual estimate = 2.126e-15
+ 8. lambda = 9.576920064300e-1 -1.784019605585e-2i | residual estimate = 2.413e-15
+ 9. lambda = 9.595485390396e-1 +7.114749047645e-8i | residual estimate = 2.167e-15
+10. lambda = 9.566572386080e-1 -2.311332757904e-8i | residual estimate = 1.798e-15
 
 history
 -------
-restart  0: krylov_dim=400, converged=0, matvecs=400, peak_memory=72788064 bytes, happy_breakdown=no
-      wanted  1: lambda = 1.000275402439e0 +8.908480939110e-5i | residual estimate = 3.804e-3
-      wanted  2: lambda = 9.922489266763e-1 -3.178434961924e-3i | residual estimate = 8.229e-3
-      wanted  3: lambda = 9.911588831384e-1 +1.504957544166e-2i | residual estimate = 7.771e-3
-      wanted  4: lambda = 9.877658930794e-1 -1.585525479006e-2i | residual estimate = 7.975e-3
-restart  1: krylov_dim=402, converged=0, matvecs=796, peak_memory=144421456 bytes, happy_breakdown=no
-      wanted  1: lambda = 1.000000021036e0 +3.011757861999e-8i | residual estimate = 1.447e-7
-      wanted  2: lambda = 9.805276012160e-1 -6.242475626788e-3i | residual estimate = 3.160e-5
-      wanted  3: lambda = 9.791060681811e-1 -1.381636844105e-2i | residual estimate = 1.770e-5
-      wanted  4: lambda = 9.791053995676e-1 +1.142573229136e-2i | residual estimate = 3.849e-5
-restart  2: krylov_dim=601, converged=0, matvecs=1390, peak_memory=181519336 bytes, happy_breakdown=no
-      wanted  1: lambda =         1.000000000000e0 | residual estimate = 4.950e-15
-      wanted  2: lambda = 9.759658646309e-1 -9.976934974265e-3i | residual estimate = 4.994e-10
-      wanted  3: lambda = 9.759654427091e-1 +9.977022869710e-3i | residual estimate = 5.428e-10
-      wanted  4: lambda = 9.726024721520e-1 +9.462432392569e-6i | residual estimate = 9.540e-10
-restart  3: krylov_dim=700, converged=1, matvecs=2083, peak_memory=231794760 bytes, happy_breakdown=no
-      wanted  1: lambda =         1.000000000000e0 | residual estimate = 1.003e-19
-      wanted  2: lambda = 9.759657299720e-1 +9.976510421560e-3i | residual estimate = 2.391e-14
-      wanted  3: lambda = 9.759657299315e-1 -9.976510483789e-3i | residual estimate = 1.818e-14
-      wanted  4: lambda = 9.725569885098e-1 +1.519177644776e-8i | residual estimate = 1.831e-13
-restart  4: krylov_dim=600, converged=2, matvecs=2677, peak_memory=231794760 bytes, happy_breakdown=no
-      wanted  1: lambda =         1.000000000000e0 | residual estimate = 6.656e-19
-      wanted  2: lambda = 9.759657299724e-1 +9.976510442387e-3i | residual estimate = 1.402e-16
-      wanted  3: lambda = 9.759657299693e-1 -9.976510439227e-3i | residual estimate = 6.615e-17
-      wanted  4: lambda = 9.725569700697e-1 +2.454575806722e-10i | residual estimate = 2.627e-15
-restart  5: krylov_dim=1000, converged=4, matvecs=3667, peak_memory=300224400 bytes, happy_breakdown=no
-      wanted  1: lambda =         1.000000000000e0 | residual estimate = 4.506e-26
-      wanted  2: lambda = 9.759657299717e-1 +9.976510441968e-3i | residual estimate = 1.871e-27
-      wanted  3: lambda = 9.759657299694e-1 -9.976510439290e-3i | residual estimate = 9.449e-24
-      wanted  4: lambda = 9.725569701401e-1 +7.805070845676e-12i | residual estimate = 1.199e-23
+restart  0: krylov_dim=500, converged=0, matvecs=500, peak_memory=55402528 bytes, happy_breakdown=no
+      wanted  1: lambda = 9.805788380588e-1 +4.639072281774e-2i | residual estimate = 5.615e-2
+      wanted  2: lambda = 9.977845575469e-1 -1.811648113475e-3i | residual estimate = 5.361e-2
+      wanted  3: lambda = 9.935610519334e-1 +1.383638658652e-2i | residual estimate = 5.801e-2
+      wanted  4: lambda = 9.922660139229e-1 -1.547235595238e-2i | residual estimate = 6.967e-2
+      wanted  5: lambda = 9.836984675150e-1 +2.234636799737e-2i | residual estimate = 5.919e-2
+      wanted  6: lambda = 9.879967385929e-1 -4.374849559972e-3i | residual estimate = 7.254e-2
+      wanted  7: lambda = 9.802851734670e-1 -4.367738950031e-2i | residual estimate = 7.206e-2
+      wanted  8: lambda = 9.795497292996e-1 -2.906970996092e-2i | residual estimate = 8.962e-2
+      wanted  9: lambda = 9.785578389205e-1 -3.645680746580e-2i | residual estimate = 9.441e-2
+      wanted 10: lambda = 9.776782275847e-1 +1.197562754786e-2i | residual estimate = 1.325e-1
+restart  1: krylov_dim=500, converged=0, matvecs=990, peak_memory=105152016 bytes, happy_breakdown=no
+      wanted  1: lambda = 1.000140441920e0 +1.008920314285e-4i | residual estimate = 1.562e-3
+      wanted  2: lambda = 9.901933531060e-1 +8.629426770790e-3i | residual estimate = 4.212e-3
+      wanted  3: lambda = 9.897209165858e-1 -6.902316374621e-3i | residual estimate = 4.077e-3
+      wanted  4: lambda = 9.783659971381e-1 -3.419056903600e-2i | residual estimate = 1.397e-2
+      wanted  5: lambda = 9.863560186915e-1 -1.671930202661e-2i | residual estimate = 1.105e-2
+      wanted  6: lambda = 9.821174000924e-1 +2.535058430634e-2i | residual estimate = 1.069e-2
+      wanted  7: lambda = 9.803204006504e-1 +1.549574801818e-2i | residual estimate = 6.167e-3
+      wanted  8: lambda = 9.808350311395e-1 +7.774406822821e-3i | residual estimate = 7.472e-3
+      wanted  9: lambda = 9.757085642539e-1 -2.425740730891e-2i | residual estimate = 1.899e-2
+      wanted 10: lambda = 9.774534883528e-1 -5.795899025247e-3i | residual estimate = 7.184e-3
+restart  2: krylov_dim=500, converged=0, matvecs=1470, peak_memory=108053344 bytes, happy_breakdown=no
+      wanted  1: lambda = 9.999989787561e-1 -2.324025618109e-6i | residual estimate = 2.003e-5
+      wanted  2: lambda = 9.835810477041e-1 +8.047427679023e-3i | residual estimate = 1.275e-4
+      wanted  3: lambda = 9.833107590606e-1 -8.407970701937e-4i | residual estimate = 1.044e-4
+      wanted  4: lambda = 9.764386164753e-1 -2.256098980403e-2i | residual estimate = 7.505e-4
+      wanted  5: lambda = 9.801590955654e-1 -1.358251464088e-2i | residual estimate = 2.194e-4
+      wanted  6: lambda = 9.815337673415e-1 -7.533738831907e-3i | residual estimate = 1.604e-4
+      wanted  7: lambda = 9.803455814108e-1 +1.672448488960e-2i | residual estimate = 1.494e-4
+      wanted  8: lambda = 9.738959624616e-1 +2.613806463793e-2i | residual estimate = 9.221e-4
+      wanted  9: lambda = 9.708609079995e-1 -1.492827567170e-2i | residual estimate = 6.909e-4
+      wanted 10: lambda = 9.726623933510e-1 +4.566846308885e-5i | residual estimate = 1.409e-3
+restart  3: krylov_dim=500, converged=0, matvecs=1950, peak_memory=108053344 bytes, happy_breakdown=no
+      wanted  1: lambda = 1.000000014383e0 +1.056353945972e-8i | residual estimate = 1.216e-7
+      wanted  2: lambda = 9.781164784224e-1 +9.792849016437e-3i | residual estimate = 1.867e-5
+      wanted  3: lambda = 9.790219161702e-1 +1.300436359677e-3i | residual estimate = 1.062e-5
+      wanted  4: lambda = 9.791153661037e-1 -7.108156334817e-3i | residual estimate = 1.109e-5
+      wanted  5: lambda = 9.767127671491e-1 -1.348310737548e-2i | residual estimate = 1.902e-5
+      wanted  6: lambda = 9.701886781459e-1 -2.066691504958e-2i | residual estimate = 9.179e-5
+      wanted  7: lambda = 9.723743825917e-1 +1.486825842406e-2i | residual estimate = 3.673e-5
+      wanted  8: lambda = 9.716992261207e-1 +2.874012986616e-3i | residual estimate = 4.166e-5
+      wanted  9: lambda = 9.669643237071e-1 +1.988206164567e-2i | residual estimate = 1.640e-4
+      wanted 10: lambda = 9.657476323526e-1 -4.969536935387e-3i | residual estimate = 7.714e-5
+restart  4: krylov_dim=500, converged=0, matvecs=2420, peak_memory=109306480 bytes, happy_breakdown=no
+      wanted  1: lambda = 1.000000000025e0 -2.356979814784e-12i | residual estimate = 3.120e-10
+      wanted  2: lambda = 9.759384839719e-1 -1.013345111851e-2i | residual estimate = 2.848e-7
+      wanted  3: lambda = 9.756182333431e-1 +9.915380600723e-3i | residual estimate = 2.236e-7
+      wanted  4: lambda = 9.753481247055e-1 +7.316781491360e-4i | residual estimate = 2.470e-7
+      wanted  5: lambda = 9.738439355592e-1 -5.074440389897e-3i | residual estimate = 3.035e-7
+      wanted  6: lambda = 9.732503447285e-1 +7.922041440358e-3i | residual estimate = 3.613e-7
+      wanted  7: lambda = 9.648869246837e-1 +1.630307829412e-2i | residual estimate = 3.202e-6
+      wanted  8: lambda = 9.667807723971e-1 -1.097135355818e-2i | residual estimate = 1.889e-6
+      wanted  9: lambda = 9.639203250947e-1 -1.631444106246e-2i | residual estimate = 4.370e-6
+      wanted 10: lambda = 9.613070397552e-1 +5.320514697032e-4i | residual estimate = 1.047e-5
+restart  5: krylov_dim=500, converged=0, matvecs=2890, peak_memory=109306480 bytes, happy_breakdown=no
+      wanted  1: lambda =        9.999999999999e-1 | residual estimate = 5.738e-13
+      wanted  2: lambda = 9.759676778152e-1 -9.976273653740e-3i | residual estimate = 2.436e-9
+      wanted  3: lambda = 9.759643047833e-1 +9.977300153967e-3i | residual estimate = 2.450e-9
+      wanted  4: lambda = 9.727027534729e-1 +2.630063695814e-4i | residual estimate = 5.012e-9
+      wanted  5: lambda = 9.705793727319e-1 -1.677292358055e-3i | residual estimate = 8.184e-9
+      wanted  6: lambda = 9.683619207454e-1 +3.524377198130e-3i | residual estimate = 1.671e-8
+      wanted  7: lambda = 9.591556420906e-1 -1.735656488834e-2i | residual estimate = 3.000e-7
+      wanted  8: lambda = 9.647549027555e-1 -7.278051045110e-3i | residual estimate = 4.630e-8
+      wanted  9: lambda = 9.617403575303e-1 +8.876535822576e-3i | residual estimate = 1.196e-7
+      wanted 10: lambda = 9.587690647394e-1 +1.494287280416e-2i | residual estimate = 3.624e-7
+restart  6: krylov_dim=500, converged=1, matvecs=3360, peak_memory=109307264 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 1.945e-15
+      wanted  2: lambda = 9.759657109403e-1 -9.976509743319e-3i | residual estimate = 3.857e-11
+      wanted  3: lambda = 9.759657525771e-1 +9.976493459678e-3i | residual estimate = 3.632e-11
+      wanted  4: lambda = 9.725554086471e-1 -4.871476149254e-6i | residual estimate = 1.263e-10
+      wanted  5: lambda = 9.697776322821e-1 +4.782423180843e-5i | residual estimate = 2.708e-10
+      wanted  6: lambda = 9.575720422576e-1 -1.811678231288e-2i | residual estimate = 2.250e-8
+      wanted  7: lambda = 9.653407990012e-1 -4.067317520484e-4i | residual estimate = 1.693e-9
+      wanted  8: lambda = 9.576356009436e-1 +1.780250091113e-2i | residual estimate = 5.139e-8
+      wanted  9: lambda = 9.610882886939e-1 +2.572032300045e-3i | residual estimate = 6.320e-9
+      wanted 10: lambda = 9.593796250044e-1 -4.533792300928e-3i | residual estimate = 9.642e-9
+restart  7: krylov_dim=500, converged=1, matvecs=3820, peak_memory=110392656 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 1.105e-15
+      wanted  2: lambda = 9.759657299427e-1 -9.976510372578e-3i | residual estimate = 1.103e-13
+      wanted  3: lambda = 9.759657299211e-1 +9.976510530158e-3i | residual estimate = 8.193e-14
+      wanted  4: lambda = 9.725569497510e-1 +2.815518714950e-8i | residual estimate = 2.979e-13
+      wanted  5: lambda = 9.697665047994e-1 -3.845591761138e-7i | residual estimate = 1.158e-12
+      wanted  6: lambda = 9.576919220669e-1 -1.783787572654e-2i | residual estimate = 2.712e-10
+      wanted  7: lambda = 9.652261272029e-1 +6.151883222972e-6i | residual estimate = 6.980e-12
+      wanted  8: lambda = 9.576952346217e-1 +1.784176764998e-2i | residual estimate = 4.644e-10
+      wanted  9: lambda = 9.597146060531e-1 -1.355649501677e-4i | residual estimate = 7.182e-11
+      wanted 10: lambda = 9.565816448863e-1 +1.825060658653e-4i | residual estimate = 3.879e-10
+restart  8: krylov_dim=500, converged=3, matvecs=4290, peak_memory=110392656 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 1.611e-15
+      wanted  2: lambda = 9.759657299784e-1 +9.976510429527e-3i | residual estimate = 3.475e-15
+      wanted  3: lambda = 9.759657299719e-1 -9.976510434733e-3i | residual estimate = 4.709e-15
+      wanted  4: lambda = 9.725569708724e-1 -4.637372721022e-10i | residual estimate = 1.381e-14
+      wanted  5: lambda = 9.697661562814e-1 +8.882594065293e-9i | residual estimate = 6.310e-14
+      wanted  6: lambda = 9.652331601115e-1 -2.208397570651e-7i | residual estimate = 6.341e-13
+      wanted  7: lambda = 9.576916885021e-1 -1.783991588272e-2i | residual estimate = 1.415e-10
+      wanted  8: lambda = 9.576920653962e-1 +1.784002436067e-2i | residual estimate = 6.675e-11
+      wanted  9: lambda = 9.595370607095e-1 +6.888018368304e-6i | residual estimate = 1.349e-11
+      wanted 10: lambda = 9.566766164992e-1 -3.662001185168e-6i | residual estimate = 8.358e-11
+restart  9: krylov_dim=500, converged=6, matvecs=4750, peak_memory=110393664 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 7.562e-16
+      wanted  2: lambda = 9.759657299749e-1 -9.976510433562e-3i | residual estimate = 2.025e-15
+      wanted  3: lambda = 9.759657299766e-1 +9.976510435314e-3i | residual estimate = 1.749e-15
+      wanted  4: lambda = 9.725569703619e-1 -2.748429611018e-10i | residual estimate = 1.749e-15
+      wanted  5: lambda = 9.697661632827e-1 +1.782083228310e-9i | residual estimate = 2.516e-15
+      wanted  6: lambda = 9.652329596605e-1 -1.001430831242e-8i | residual estimate = 4.127e-15
+      wanted  7: lambda = 9.576920045201e-1 +1.784019640802e-2i | residual estimate = 3.450e-13
+      wanted  8: lambda = 9.576920090585e-1 -1.784019610340e-2i | residual estimate = 6.248e-13
+      wanted  9: lambda = 9.595486332291e-1 +1.294158222887e-7i | residual estimate = 5.725e-14
+      wanted 10: lambda = 9.566569930294e-1 -1.874972526737e-7i | residual estimate = 5.060e-13
+restart 10: krylov_dim=500, converged=7, matvecs=5220, peak_memory=110393664 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 9.352e-16
+      wanted  2: lambda = 9.759657299762e-1 -9.976510433875e-3i | residual estimate = 2.483e-15
+      wanted  3: lambda = 9.759657299780e-1 +9.976510438942e-3i | residual estimate = 1.999e-15
+      wanted  4: lambda = 9.725569702130e-1 -3.826191231750e-10i | residual estimate = 2.041e-15
+      wanted  5: lambda = 9.697661639116e-1 +2.405573999157e-9i | residual estimate = 2.853e-15
+      wanted  6: lambda = 9.652329591525e-1 -1.151661085339e-8i | residual estimate = 2.473e-15
+      wanted  7: lambda = 9.576920063493e-1 -1.784019604465e-2i | residual estimate = 8.572e-14
+      wanted  8: lambda = 9.576920063209e-1 +1.784019580243e-2i | residual estimate = 6.156e-14
+      wanted  9: lambda = 9.595485370616e-1 +7.252838320195e-8i | residual estimate = 9.171e-15
+      wanted 10: lambda = 9.566572355771e-1 -5.947590125270e-8i | residual estimate = 9.832e-14
+restart 11: krylov_dim=500, converged=10, matvecs=5680, peak_memory=110393664 bytes, happy_breakdown=no
+      wanted  1: lambda =         1.000000000000e0 | residual estimate = 0.000e0
+      wanted  2: lambda = 9.759657299719e-1 +9.976510438524e-3i | residual estimate = 1.903e-15
+      wanted  3: lambda = 9.759657299813e-1 -9.976510427903e-3i | residual estimate = 1.739e-15
+      wanted  4: lambda = 9.725569704101e-1 -9.202897201209e-10i | residual estimate = 1.501e-15
+      wanted  5: lambda = 9.697661631692e-1 +4.764069956895e-9i | residual estimate = 1.605e-15
+      wanted  6: lambda = 9.652329599279e-1 -1.744509967263e-8i | residual estimate = 1.739e-15
+      wanted  7: lambda = 9.576920064002e-1 +1.784019581103e-2i | residual estimate = 2.126e-15
+      wanted  8: lambda = 9.576920064300e-1 -1.784019605585e-2i | residual estimate = 2.413e-15
+      wanted  9: lambda = 9.595485390396e-1 +7.114749047645e-8i | residual estimate = 2.167e-15
+      wanted 10: lambda = 9.566572386080e-1 -2.311332757904e-8i | residual estimate = 1.798e-15

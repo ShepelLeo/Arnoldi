@@ -36,43 +36,55 @@ pub fn select_ritz_values(
         )));
     }
 
-    let wanted = base_selection(values, target, retained_dimension, &order);
-    let mut keep_flags = vec![false; values.len()];
-    let mut retained = wanted.clone();
-    wanted.iter().for_each(|&index| keep_flags[index] = true);
+    let mut wanted = base_selection(values, target, retained_dimension, &order);
+    wanted.sort_unstable();
 
-    if !wanted.is_empty() && retained.len() < max_keep {
-        let center = ritz_center(values, &wanted);
-        let radius = wanted
-            .iter()
-            .map(|&index| (values[index] - center).norm())
-            .fold(0.0, f64::max);
-        let inflated_radius = inflation * radius;
-        let slack = 100.0 * f64::EPSILON * center.norm().max(inflated_radius).max(1.0);
-
-        for &index in &order {
-            if retained.len() == max_keep {
-                break;
-            }
-            if keep_flags[index] {
-                continue;
-            }
-            if (values[index] - center).norm() <= inflated_radius + slack {
-                retained.push(index);
-                keep_flags[index] = true;
-            }
-        }
-    }
+    let retained = cap_retained(
+        topology_cluster(values, &wanted, target, inflation),
+        &wanted,
+        &order,
+        values.len(),
+        max_keep,
+    );
 
     Ok(SelectionOut { wanted, retained })
 }
 
-fn ritz_center(values: &[Complex64], indices: &[usize]) -> Complex64 {
-    let sum = indices
-        .iter()
-        .map(|&index| values[index])
-        .sum::<Complex64>();
-    sum / indices.len() as f64
+fn cap_retained(
+    retained: Vec<usize>,
+    wanted: &[usize],
+    ranking_order: &[usize],
+    values_len: usize,
+    max_keep: usize,
+) -> Vec<usize> {
+    let mut in_cluster = vec![false; values_len];
+    for index in retained {
+        if index < values_len {
+            in_cluster[index] = true;
+        }
+    }
+
+    let mut selected = vec![false; values_len];
+    let mut result = Vec::with_capacity(max_keep.min(values_len));
+    for &index in wanted {
+        if index < values_len && !selected[index] {
+            selected[index] = true;
+            result.push(index);
+        }
+    }
+
+    for &index in ranking_order {
+        if result.len() >= max_keep {
+            break;
+        }
+        if index < values_len && in_cluster[index] && !selected[index] {
+            selected[index] = true;
+            result.push(index);
+        }
+    }
+
+    result.sort_unstable();
+    result
 }
 
 fn base_selection(
@@ -120,6 +132,81 @@ fn base_selection(
             }
 
             result
+        }
+    }
+}
+
+fn topology_cluster(
+    values: &[Complex64],
+    wanted: &[usize],
+    target: SpectrumTarget,
+    inflation: f64,
+) -> Vec<usize> {
+    match target {
+        SpectrumTarget::LargestMagnitude | SpectrumTarget::SmallestMagnitude => {
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].norm());
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].norm() - center).abs())
+                .fold(0.0_f64, f64::max);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.norm() - center).abs() <= radius * inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+            retained
+        }
+
+        SpectrumTarget::LargestReal | SpectrumTarget::SmallestReal => {
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].re);
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].re - center).abs())
+                .fold(0.0_f64, f64::max);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.re - center).abs() <= radius * inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+            retained
+        }
+
+        SpectrumTarget::BothEndsReal => {
+            let sum = wanted.iter().fold(0.0, |acc, &i| acc + values[i].re);
+
+            let center = sum / wanted.len() as f64;
+
+            // 6. Radius = максимальное расстояние от center до выбранных чисел
+            let radius = wanted
+                .iter()
+                .map(|&i| (values[i].re - center).abs())
+                .fold(0.0_f64, f64::min);
+
+            // 7. retained = числа вне окружности
+            let retained: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, z)| (z.re - center).abs() > radius / inflation)
+                .map(|(i, _)| i)
+                .collect();
+
+            retained
         }
     }
 }
@@ -222,7 +309,7 @@ mod tests {
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted.len(), 2);
-        assert_eq!(selection.retained.len(), 2);
+        assert_eq!(selection.retained.len(), 3);
     }
 
     #[test]
@@ -239,5 +326,24 @@ mod tests {
 
         assert_eq!(selection.wanted, vec![0, 1]);
         assert_eq!(selection.retained, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn retained_set_respects_max_keep() {
+        let values = vec![
+            Complex64::new(5.0, 0.0),
+            Complex64::new(4.0, 0.0),
+            Complex64::new(3.0, 0.0),
+            Complex64::new(2.0, 0.0),
+            Complex64::new(1.0, 0.0),
+        ];
+
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 3, 10.0)
+            .expect("selection should succeed");
+
+        assert_eq!(selection.wanted, vec![0, 1]);
+        assert_eq!(selection.retained.len(), 3);
+        assert!(selection.retained.contains(&0));
+        assert!(selection.retained.contains(&1));
     }
 }

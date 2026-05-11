@@ -7,14 +7,14 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use complex_block_cpu::config::{SolverConfig, SpectrumTarget};
-use complex_block_cpu::linalg::ops::{normalize, normalized_random_unitary_matrix};
+use complex_block_cpu::linalg::ops::normalized_random_unitary_matrix;
 use complex_block_cpu::memory;
 use complex_block_cpu::operator::{
     ConvectionDiffusionOperator, GrcarOperator, IdentityOperator, LinearOperator,
-    matrix_operator_from_text_file, parse_complex_token,
+    matrix_operator_from_text_file,
 };
 use complex_block_cpu::{IramError, solve_block};
-use ndarray::{Array1, Array2, Axis};
+use ndarray::Array2;
 use num_complex::Complex64;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -31,11 +31,11 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     nev: usize,
 
-    /// Размер стартового и последующих блочных пополнений; по умолчанию равен nev
+    /// Размер стартового блока; по умолчанию равен nev
     #[arg(long)]
     block_size: Option<usize>,
 
-    /// Количество блочных итераций Arnoldi
+    /// Размерность подпространства Крылова в блоках
     #[arg(long)]
     ncv: usize,
 
@@ -67,10 +67,6 @@ struct Cli {
     #[arg(long)]
     matrix_file: Option<PathBuf>,
 
-    /// Стартовый вектор
-    #[arg(long)]
-    start_vector: Option<PathBuf>,
-
     /// Параметр матрицы (1)
     #[arg(long, default_value_t = 3)]
     grcar_upper: usize,
@@ -79,7 +75,7 @@ struct Cli {
     #[arg(long, default_value_t = 100.0)]
     rho: f64,
 
-    /// Сид генерации стартового вектора
+    /// Сид генерации стартового блока
     #[arg(long, default_value_t = 0)]
     seed: u64,
 
@@ -187,32 +183,6 @@ fn build_start_block(
     dimension: usize,
     rng: &mut StdRng,
 ) -> Result<(Array2<Complex64>, String), IramError> {
-    if let Some(path) = &cli.start_vector {
-        if block_size != 1 {
-            return Err(IramError::InvalidConfig(
-                "--start-vector can only be used with --block-size 1".to_string(),
-            ));
-        }
-
-        let content = fs::read_to_string(path)?;
-        let entries = content
-            .split_whitespace()
-            .map(parse_complex_token)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if entries.len() != dimension {
-            return Err(IramError::DimensionMismatch {
-                expected: dimension,
-                got: entries.len(),
-            });
-        }
-
-        let mut vector = Array1::from_vec(entries);
-        normalize(&mut vector, "user-supplied start vector")?;
-        let block = vector.insert_axis(Axis(1));
-        return Ok((block, format!("loaded from {}", path.display())));
-    }
-
     normalized_random_unitary_matrix(dimension, block_size, rng).map(|block| {
         (
             block,

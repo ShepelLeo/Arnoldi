@@ -1,589 +1,389 @@
-//! Блочный процесс Арнольди.
-use ndarray::{Array2, ArrayView2, ShapeBuilder, s};
+//! Процесс Арнольди
+use ndarray::{Array2, ArrayViewMut2, DataMut, ShapeBuilder, s};
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::lapack::{
-    HouseholderQrWorkspace, PivotedQrWorkspace, ZgemmTranspose, zgemm, zgemm_into,
-    zgeqp3_qr_rank_with_workspace, zgeqrf_qr_with_workspace,
-};
+use crate::linalg::ops::{OrthogonalizationWorkspaces, orthogonalize_with_reorthogonalization};
 use crate::operator::LinearOperator;
 
+/// Ответ процесса
 #[derive(Debug, Clone)]
-pub struct BlockArnoldiFactorization {
+pub struct ArnoldiFactorization {
     pub basis: Array2<Complex64>,
     pub hessenberg: Array2<Complex64>,
-    pub block_sizes: Vec<usize>,
-    pub next_block_size: usize,
-    pub performed_blocks: usize,
+    pub performed_steps: usize,
     pub happy_breakdown: bool,
 }
 
-#[derive(Debug)]
-pub struct BlockOrthogonalization {
-    pub q_next: Array2<Complex64>,
-    pub subdiagonal: Array2<Complex64>,
-    pub rank: usize,
+pub(crate) struct ArnoldiContinuation {
+    pub basis: Array2<Complex64>,
+    pub hessenberg: Array2<Complex64>,
+    pub start_step: usize,
+    pub block_size: usize,
+    pub target_steps: usize,
+    pub breakdown_tol: f64,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct BlockArnoldiWorkspaces {
-    pub basis_pivoted_qr: PivotedQrWorkspace,
-    residual_qr: HouseholderQrWorkspace,
-    reorthogonalized_qr: HouseholderQrWorkspace,
-    rank_pivoted_qr: PivotedQrWorkspace,
+use ndarray::{ArrayBase, ArrayView2, Data, Ix2};
+pub(crate) trait BlockViewExt<A> {
+    /// Количество блоков по строкам.
+    fn brows(&self, block_size: usize) -> usize;
+
+    /// Количество блоков по столбцам.
+    fn bcols(&self, block_size: usize) -> usize;
+
+    fn block_view(&self, block_size: usize, block_i: usize, block_j: usize) -> ArrayView2<'_, A>;
+
+    fn bcolumn(&self, block_size: usize, block_j: usize) -> ArrayView2<'_, A>;
+
+    fn norm_f(&self) -> f64;
+    fn norm_c(&self) -> f64;
 }
 
-impl BlockArnoldiFactorization {
-    pub fn krylov_dimension(&self) -> usize {
-        self.block_sizes.iter().sum()
-    }
+pub(crate) trait BlockViewMutExt<A>: BlockViewExt<A> {
+    fn block_view_mut(
+        &mut self,
+        block_size: usize,
+        block_i: usize,
+        block_j: usize,
+    ) -> ArrayViewMut2<'_, A>;
 
-    pub fn total_basis_columns(&self) -> usize {
-        self.krylov_dimension() + self.next_block_size
-    }
+    fn bcolumn_mut(&mut self, block_size: usize, block_j: usize) -> ArrayViewMut2<'_, A>;
+}
 
-    pub fn square_hessenberg(&self) -> Array2<Complex64> {
-        let dim = self.krylov_dimension();
-        self.hessenberg.slice(s![0..dim, 0..dim]).to_owned()
-    }
+trait ScalarNorm2 {
+    fn abs2(&self) -> f64;
+}
 
-    pub fn last_block_range(&self) -> std::ops::Range<usize> {
-        let end = self.krylov_dimension();
-        let start = end - self.block_sizes.last().copied().unwrap_or(0);
-        start..end
-    }
+trait ScalarAbs {
+    fn abs_value(&self) -> f64;
+}
 
-    pub fn trailing_coupling(&self) -> Array2<Complex64> {
-        if self.happy_breakdown || self.next_block_size == 0 {
-            return Array2::zeros((0, self.block_sizes.last().copied().unwrap_or(0)).f());
-        }
-
-        let dim = self.krylov_dimension();
-        let last = self.last_block_range();
-        self.hessenberg
-            .slice(s![dim..dim + self.next_block_size, last])
-            .to_owned()
-    }
-
-    pub fn krylov_basis(&self) -> ArrayView2<'_, Complex64> {
-        let dim = self.krylov_dimension();
-        self.basis.slice(s![.., 0..dim])
-    }
-
-    pub fn next_basis_block(&self) -> Option<ArrayView2<'_, Complex64>> {
-        if self.next_block_size == 0 {
-            return None;
-        }
-
-        let dim = self.krylov_dimension();
-        Some(self.basis.slice(s![.., dim..dim + self.next_block_size]))
+impl ScalarAbs for f64 {
+    fn abs_value(&self) -> f64 {
+        self.abs()
     }
 }
 
-pub fn run_block_arnoldi(
-    operator: &dyn LinearOperator,
-    start_block: &Array2<Complex64>,
-    target_blocks: usize,
-    breakdown_tol: f64,
-    matvec_count: &mut usize,
-) -> Result<BlockArnoldiFactorization, IramError> {
-    let mut workspaces = BlockArnoldiWorkspaces::default();
-    run_block_arnoldi_with_workspaces(
-        operator,
-        start_block,
-        target_blocks,
-        breakdown_tol,
-        matvec_count,
-        &mut workspaces,
-    )
+impl ScalarAbs for Complex64 {
+    fn abs_value(&self) -> f64 {
+        self.norm()
+    }
 }
 
-pub(crate) fn run_block_arnoldi_with_workspaces(
-    operator: &dyn LinearOperator,
-    start_block: &Array2<Complex64>,
-    target_blocks: usize,
-    breakdown_tol: f64,
-    matvec_count: &mut usize,
-    workspaces: &mut BlockArnoldiWorkspaces,
-) -> Result<BlockArnoldiFactorization, IramError> {
-    if target_blocks == 0 {
-        return Err(IramError::InvalidConfig(
-            "block Arnoldi needs at least one block iteration".to_string(),
-        ));
+impl ScalarNorm2 for f64 {
+    fn abs2(&self) -> f64 {
+        self * self
     }
-
-    if start_block.nrows() != operator.dimension() {
-        return Err(IramError::DimensionMismatch {
-            expected: operator.dimension(),
-            got: start_block.nrows(),
-        });
-    }
-
-    let start_qr =
-        zgeqp3_qr_rank_with_workspace(start_block, breakdown_tol, &mut workspaces.basis_pivoted_qr)
-            .map_err(IramError::Spectral)?;
-    if start_qr.rank == 0 {
-        return Err(IramError::ZeroVector("block Arnoldi start block"));
-    }
-
-    let hessenberg = Array2::zeros((start_qr.rank, 0).f());
-    continue_block_arnoldi_from_parts(
-        operator,
-        start_qr.q,
-        hessenberg,
-        vec![start_qr.rank],
-        0,
-        target_blocks,
-        breakdown_tol,
-        matvec_count,
-        workspaces,
-    )
 }
 
-pub(crate) fn continue_block_arnoldi_from_parts(
-    operator: &dyn LinearOperator,
-    basis: Array2<Complex64>,
-    hessenberg: Array2<Complex64>,
-    mut block_sizes: Vec<usize>,
-    mut completed_blocks: usize,
-    target_blocks: usize,
-    breakdown_tol: f64,
-    matvec_count: &mut usize,
-    workspaces: &mut BlockArnoldiWorkspaces,
-) -> Result<BlockArnoldiFactorization, IramError> {
-    let mut happy_breakdown = false;
-    let max_block_size = block_sizes.iter().copied().max().unwrap_or(0);
-    let remaining_blocks = target_blocks.saturating_sub(completed_blocks);
-    let capacity_cols = basis
-        .ncols()
-        .saturating_add(remaining_blocks.saturating_mul(max_block_size))
-        .min(operator.dimension())
-        .max(basis.ncols())
-        .max(hessenberg.nrows())
-        .max(hessenberg.ncols());
-    let mut basis_store = Array2::zeros((operator.dimension(), capacity_cols).f());
-    basis_store
-        .slice_mut(s![.., 0..basis.ncols()])
-        .assign(&basis);
-    let mut hessenberg_store = Array2::zeros((capacity_cols, capacity_cols).f());
-    if hessenberg.nrows() > 0 && hessenberg.ncols() > 0 {
-        hessenberg_store
-            .slice_mut(s![0..hessenberg.nrows(), 0..hessenberg.ncols()])
-            .assign(&hessenberg);
+impl ScalarNorm2 for Complex64 {
+    fn abs2(&self) -> f64 {
+        self.norm_sqr()
     }
-    let mut active_basis_cols = basis.ncols();
-    let mut active_h_rows = hessenberg.nrows();
-    let mut active_h_cols = hessenberg.ncols();
+}
 
-    while completed_blocks < target_blocks {
-        if completed_blocks >= block_sizes.len() {
-            return Err(IramError::InvalidConfig(format!(
-                "block Arnoldi continuation has no block {} to extend",
-                completed_blocks + 1,
-            )));
-        }
+impl<A, S> BlockViewExt<A> for ArrayBase<S, Ix2>
+where
+    A: ScalarNorm2 + ScalarAbs,
+    S: Data<Elem = A>,
+{
+    fn brows(&self, block_size: usize) -> usize {
+        assert!(block_size > 0, "block_size must be > 0");
 
-        let current_offset = block_sizes[..completed_blocks].iter().sum::<usize>();
-        let current_size = block_sizes[completed_blocks];
-        let q_total_cols = current_offset + current_size;
+        self.nrows().div_ceil(block_size)
+    }
 
-        if active_h_rows != q_total_cols || active_h_cols != current_offset {
-            return Err(IramError::InvalidConfig(format!(
-                "block Hessenberg shape is {}x{}, expected {}x{} before block {}",
-                active_h_rows,
-                active_h_cols,
-                q_total_cols,
-                current_offset,
-                completed_blocks + 1,
-            )));
-        }
+    fn bcols(&self, block_size: usize) -> usize {
+        assert!(block_size > 0, "block_size must be > 0");
 
-        // Q_{1:k} = [Q_1, ..., Q_k], W = A Q_k.
-        let q_total = basis_store.slice(s![.., 0..q_total_cols]);
-        let qk = basis_store.slice(s![.., current_offset..q_total_cols]);
-        let mut aqk = Array2::zeros((operator.dimension(), current_size).f());
-        operator.apply_block_into(qk, aqk.view_mut())?;
-        *matvec_count += current_size;
+        self.ncols().div_ceil(block_size)
+    }
 
-        // C_k = Q_{1:k}^* W,  W <- W - Q_{1:k} C_k.
-        let reference_norms = column_norms(aqk.view());
-        let mut column = zgemm(
-            ZgemmTranspose::ConjugateTranspose,
-            ZgemmTranspose::None,
-            q_total,
-            aqk.view(),
-        );
-        let mut residual = aqk;
-        zgemm_into(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            Complex64::new(-1.0, 0.0),
-            q_total,
-            column.view(),
-            Complex64::new(1.0, 0.0),
-            residual.view_mut(),
-        );
+    fn block_view(&self, block_size: usize, block_i: usize, block_j: usize) -> ArrayView2<'_, A> {
+        assert!(block_size > 0, "block_size must be > 0");
 
-        // Reorthogonalize W against Q_{1:k}; QR + rank-revealing QR gives
-        // Q_{k+1} and the subdiagonal block R_{k+1}.
-        let orthogonalized = orthogonalize_block_residual(
-            q_total,
-            &mut column,
-            residual,
-            &reference_norms,
-            breakdown_tol,
-            workspaces,
-        )?;
+        assert!(block_i < self.brows(block_size), "block_i is out of bounds");
+        assert!(block_j < self.bcols(block_size), "block_j is out of bounds");
 
-        let new_rows = q_total_cols + orthogonalized.rank;
-        let new_cols = q_total_cols;
-        if new_rows > capacity_cols {
-            return Err(IramError::InvalidConfig(format!(
-                "block Arnoldi capacity {capacity_cols} is smaller than the required {new_rows} basis columns",
-            )));
-        }
-        // H(1:k,k) = C_k.
-        hessenberg_store
-            .slice_mut(s![0..q_total_cols, current_offset..q_total_cols])
-            .assign(&column);
+        let row_start = block_i * block_size;
+        let col_start = block_j * block_size;
 
-        if orthogonalized.rank > 0 {
-            // H(k+1,k) = R_{k+1},  Q_total <- [Q_total, Q_{k+1}].
-            hessenberg_store
-                .slice_mut(s![q_total_cols..new_rows, current_offset..q_total_cols])
-                .assign(&orthogonalized.subdiagonal);
-            basis_store
-                .slice_mut(s![.., q_total_cols..new_rows])
-                .assign(&orthogonalized.q_next);
-            block_sizes.push(orthogonalized.rank);
-            active_basis_cols = new_rows;
+        let row_end = (row_start + block_size).min(self.nrows());
+        let col_end = (col_start + block_size).min(self.ncols());
+
+        self.slice(s![row_start..row_end, col_start..col_end])
+    }
+
+    fn bcolumn(&self, block_size: usize, block_j: usize) -> ArrayView2<'_, A> {
+        assert!(block_size > 0, "block_size must be > 0");
+
+        assert!(block_j < self.bcols(block_size), "block_j is out of bounds");
+
+        let col_start = block_j * block_size;
+        let col_end = (col_start + block_size).min(self.ncols());
+
+        self.slice(s![.., col_start..col_end])
+    }
+
+    fn norm_f(&self) -> f64 {
+        self.iter().map(|x| x.abs2()).sum::<f64>().sqrt()
+    }
+
+    fn norm_c(&self) -> f64 {
+        self.rows()
+            .into_iter()
+            .map(|row| row.iter().map(|x| x.abs_value()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    }
+}
+
+impl<A, S> BlockViewMutExt<A> for ArrayBase<S, Ix2>
+where
+    A: ScalarNorm2 + ScalarAbs,
+    S: DataMut<Elem = A>,
+{
+    fn block_view_mut(
+        &mut self,
+        block_size: usize,
+        block_i: usize,
+        block_j: usize,
+    ) -> ArrayViewMut2<'_, A> {
+        assert!(block_size > 0, "block_size must be > 0");
+
+        assert!(block_i < self.brows(block_size), "block_i is out of bounds");
+        assert!(block_j < self.bcols(block_size), "block_j is out of bounds");
+
+        let row_start = block_i * block_size;
+        let col_start = block_j * block_size;
+
+        let row_end = (row_start + block_size).min(self.nrows());
+        let col_end = (col_start + block_size).min(self.ncols());
+
+        self.slice_mut(s![row_start..row_end, col_start..col_end])
+    }
+
+    fn bcolumn_mut(&mut self, block_size: usize, block_j: usize) -> ArrayViewMut2<'_, A> {
+        assert!(block_size > 0, "block_size must be > 0");
+        assert!(block_j < self.bcols(block_size), "block_j is out of bounds");
+
+        let col_start = block_j * block_size;
+        let col_end = (col_start + block_size).min(self.ncols());
+
+        self.slice_mut(s![.., col_start..col_end])
+    }
+}
+
+impl ArnoldiFactorization {
+    pub fn square_hessenberg_view(&self, block_size: usize) -> ArrayView2<'_, Complex64> {
+        self.hessenberg.slice(s![
+            0..self.performed_steps * block_size,
+            0..self.performed_steps * block_size
+        ])
+    }
+
+    pub fn trailing_subdiagonal(&self, block_size: usize) -> Array2<Complex64> {
+        if self.happy_breakdown || self.performed_steps == 0 {
+            Array2::<Complex64>::zeros((block_size, block_size))
         } else {
-            active_basis_cols = q_total_cols;
-            happy_breakdown = true;
+            self.hessenberg
+                .block_view(block_size, self.performed_steps, self.performed_steps - 1)
+                .to_owned()
+        }
+    }
+}
+
+/// Вход в процесс Арнольди, первый прогон при инициализации пространства Крылова
+pub fn run_arnoldi(
+    operator: &dyn LinearOperator,
+    start_block: &Array2<Complex64>,
+    steps: usize,
+    breakdown_tol: f64,
+    matvec_count: &mut usize,
+) -> Result<ArnoldiFactorization, IramError> {
+    let block_size = start_block.ncols();
+
+    let mut basis = Array2::zeros((operator.dimension(), (steps + 1) * block_size).f());
+    basis.slice_mut(s![.., 0..block_size]).assign(start_block);
+    let hessenberg = Array2::zeros(((steps + 1) * block_size, steps * block_size).f());
+    continue_arnoldi(
+        operator,
+        ArnoldiContinuation {
+            basis,
+            hessenberg,
+            start_step: 0,
+            block_size,
+            target_steps: steps,
+            breakdown_tol,
+        },
+        matvec_count,
+    )
+}
+
+/// Вход в процесс Арнольди, второй и последующие прогоны, пополняем пространство Крыллова
+pub(crate) fn continue_arnoldi(
+    operator: &dyn LinearOperator,
+    continuation: ArnoldiContinuation,
+    matvec_count: &mut usize,
+) -> Result<ArnoldiFactorization, IramError> {
+    let ArnoldiContinuation {
+        mut basis,
+        mut hessenberg,
+        start_step,
+        block_size,
+        target_steps,
+        breakdown_tol,
+    } = continuation;
+
+    if hessenberg.brows(block_size) != target_steps + 1
+        || hessenberg.bcols(block_size) != target_steps
+    {
+        return Err(IramError::InvalidConfig(format!(
+            "Arnoldi continuation expected Hessenberg block shape {}x{}, got {}x{}",
+            target_steps + 1,
+            target_steps,
+            hessenberg.brows(block_size),
+            hessenberg.bcols(block_size),
+        )));
+    }
+
+    if basis.bcols(block_size) < target_steps + 1 {
+        return Err(IramError::InvalidConfig(format!(
+            "Arnoldi continuation needs at least {} basis vectors, got {}",
+            target_steps + 1,
+            basis.ncols(),
+        )));
+    }
+
+    let mut performed_steps = start_step;
+    let mut happy_breakdown = false;
+
+    let mut h_column = Array2::zeros((block_size * target_steps, block_size).f());
+
+    let mut candidate = Array2::zeros((operator.dimension(), block_size).f());
+    let mut orthogonalization_workspaces = OrthogonalizationWorkspaces::default();
+
+    for step in start_step..target_steps {
+        operator.apply_block_into(basis.bcolumn(block_size, step), candidate.view_mut())?;
+        let candidate_old = candidate.norm_f();
+        *matvec_count += block_size;
+
+        h_column.fill(Complex64::ZERO);
+        let orthogonalized = orthogonalize_with_reorthogonalization(
+            candidate.view_mut(),
+            basis.slice(s![.., 0..(step + 1) * block_size]),
+            h_column.view_mut(),
+            candidate_old,
+            breakdown_tol,
+            block_size,
+            &mut orthogonalization_workspaces,
+        );
+
+        for row in 0..=step {
+            hessenberg
+                .block_view_mut(block_size, row, step)
+                .assign(&h_column.block_view(block_size, row, 0));
         }
 
-        active_h_rows = new_rows;
-        active_h_cols = new_cols;
-        completed_blocks += 1;
+        performed_steps = step + 1;
 
-        if happy_breakdown {
+        if orthogonalized.happy_breakdown {
+            happy_breakdown = true;
+            hessenberg
+                .block_view_mut(block_size, step + 1, step)
+                .fill(Complex64::ZERO);
             break;
         }
+        hessenberg
+            .block_view_mut(block_size, step + 1, step)
+            .assign(&orthogonalized.residual);
+        basis.bcolumn_mut(block_size, step + 1).assign(&candidate);
     }
 
-    if happy_breakdown {
-        let basis_cols = block_sizes.iter().sum::<usize>();
-        return Ok(BlockArnoldiFactorization {
-            basis: basis_store.slice(s![.., 0..basis_cols]).to_owned(),
-            hessenberg: hessenberg_store
-                .slice(s![0..active_h_rows, 0..active_h_cols])
-                .to_owned(),
-            block_sizes,
-            next_block_size: 0,
-            performed_blocks: completed_blocks,
-            happy_breakdown: true,
-        });
-    }
-
-    let performed_blocks = completed_blocks.min(target_blocks);
-    let basis_block_sizes = block_sizes[0..performed_blocks].to_vec();
-    let basis_cols = basis_block_sizes.iter().sum::<usize>();
-    let next_block_size = block_sizes.get(performed_blocks).copied().unwrap_or(0);
-    let total_cols = basis_cols + next_block_size;
-    debug_assert!(total_cols <= active_basis_cols);
-
-    Ok(BlockArnoldiFactorization {
-        basis: basis_store.slice(s![.., 0..total_cols]).to_owned(),
-        hessenberg: hessenberg_store
-            .slice(s![0..total_cols, 0..basis_cols])
-            .to_owned(),
-        block_sizes: basis_block_sizes,
-        next_block_size,
-        performed_blocks,
-        happy_breakdown: false,
+    Ok(ArnoldiFactorization {
+        basis,
+        hessenberg,
+        performed_steps,
+        happy_breakdown,
     })
-}
-
-pub(crate) fn orthogonalize_block_residual(
-    basis: ArrayView2<'_, Complex64>,
-    top_block: &mut Array2<Complex64>,
-    mut residual: Array2<Complex64>,
-    reference_norms: &[f64],
-    breakdown_tol: f64,
-    workspaces: &mut BlockArnoldiWorkspaces,
-) -> Result<BlockOrthogonalization, IramError> {
-    if residual.ncols() == 0 {
-        return Ok(BlockOrthogonalization {
-            q_next: Array2::zeros((basis.nrows(), 0).f()),
-            subdiagonal: Array2::zeros((0, 0).f()),
-            rank: 0,
-        });
-    }
-
-    // C_hat = Q^* W,  C <- C + C_hat,  W <- W - Q C_hat.
-    let correction = zgemm(
-        ZgemmTranspose::ConjugateTranspose,
-        ZgemmTranspose::None,
-        basis,
-        residual.view(),
-    );
-    *top_block += &correction;
-    zgemm_into(
-        ZgemmTranspose::None,
-        ZgemmTranspose::None,
-        Complex64::new(-1.0, 0.0),
-        basis,
-        correction.view(),
-        Complex64::new(1.0, 0.0),
-        residual.view_mut(),
-    );
-
-    // W = U R.
-    let first_qr = zgeqrf_qr_with_workspace(&residual, &mut workspaces.residual_qr)
-        .map_err(IramError::Spectral)?;
-    let mut u = first_qr.q;
-    let mut r = first_qr.r;
-
-    // If Q^* U is not negligible:
-    //   C <- C + (Q^* U) R,
-    //   U <- U - Q (Q^* U),
-    //   U = U_hat R_hat,  R <- R_hat R.
-    let c_hat = zgemm(
-        ZgemmTranspose::ConjugateTranspose,
-        ZgemmTranspose::None,
-        basis,
-        u.view(),
-    );
-    if max_column_norm(c_hat.view()) > 1000.0 * f64::EPSILON {
-        zgemm_into(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            Complex64::new(1.0, 0.0),
-            c_hat.view(),
-            r.view(),
-            Complex64::new(1.0, 0.0),
-            top_block.view_mut(),
-        );
-        let mut reorthogonalized = u;
-        zgemm_into(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            Complex64::new(-1.0, 0.0),
-            basis,
-            c_hat.view(),
-            Complex64::new(1.0, 0.0),
-            reorthogonalized.view_mut(),
-        );
-
-        let second_qr =
-            zgeqrf_qr_with_workspace(&reorthogonalized, &mut workspaces.reorthogonalized_qr)
-                .map_err(IramError::Spectral)?;
-        u = second_qr.q;
-        r = zgemm(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            second_qr.r.view(),
-            r.view(),
-        );
-    }
-
-    // D = diag(1 / ||(A Q_k)_i||_2), factor R D by pivoted QR:
-    //   R D P = V T,  rank(T) = r.
-    let mut scaled_r = r.clone();
-    for column in 0..scaled_r.ncols() {
-        let scale = reference_norms
-            .get(column)
-            .copied()
-            .filter(|norm| *norm > f64::EPSILON)
-            .map(|norm| 1.0 / norm)
-            .unwrap_or(1.0);
-        for row in 0..scaled_r.nrows() {
-            scaled_r[[row, column]] *= Complex64::new(scale, 0.0);
-        }
-    }
-
-    let pivoted =
-        zgeqp3_qr_rank_with_workspace(&scaled_r, breakdown_tol, &mut workspaces.rank_pivoted_qr)
-            .map_err(IramError::Spectral)?;
-    if pivoted.rank == 0 {
-        return Ok(BlockOrthogonalization {
-            q_next: Array2::zeros((basis.nrows(), 0).f()),
-            subdiagonal: Array2::zeros((0, scaled_r.ncols()).f()),
-            rank: 0,
-        });
-    }
-
-    // Q_{k+1} = U V(:,1:r),
-    // R_{k+1} = T(1:r,:) P^T D^{-1}.
-    let q_next = zgemm(
-        ZgemmTranspose::None,
-        ZgemmTranspose::None,
-        u.view(),
-        pivoted.q.view(),
-    );
-    let subdiagonal = unpivot_and_unscale(&pivoted.r, &pivoted.pivots, reference_norms);
-
-    Ok(BlockOrthogonalization {
-        q_next,
-        subdiagonal,
-        rank: pivoted.rank,
-    })
-}
-
-pub(crate) fn append_columns(
-    left: ArrayView2<'_, Complex64>,
-    right: ArrayView2<'_, Complex64>,
-) -> Array2<Complex64> {
-    assert_eq!(left.nrows(), right.nrows());
-
-    let mut result = Array2::zeros((left.nrows(), left.ncols() + right.ncols()).f());
-    result.slice_mut(s![.., 0..left.ncols()]).assign(&left);
-    result.slice_mut(s![.., left.ncols()..]).assign(&right);
-    result
-}
-
-pub(crate) fn column_norms(matrix: ArrayView2<'_, Complex64>) -> Vec<f64> {
-    (0..matrix.ncols())
-        .map(|column| {
-            matrix
-                .column(column)
-                .iter()
-                .map(|entry| entry.norm_sqr())
-                .sum::<f64>()
-                .sqrt()
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn frobenius_norm(matrix: ArrayView2<'_, Complex64>) -> f64 {
-    matrix
-        .iter()
-        .map(|entry| entry.norm_sqr())
-        .sum::<f64>()
-        .sqrt()
-}
-
-fn max_column_norm(matrix: ArrayView2<'_, Complex64>) -> f64 {
-    column_norms(matrix).into_iter().fold(0.0, f64::max)
-}
-
-fn unpivot_and_unscale(
-    pivoted_r: &Array2<Complex64>,
-    pivots: &[usize],
-    reference_norms: &[f64],
-) -> Array2<Complex64> {
-    let rank = pivoted_r.nrows();
-    let columns = pivoted_r.ncols();
-    let mut result = Array2::zeros((rank, columns).f());
-
-    for pivoted_column in 0..columns {
-        let original_column = pivots
-            .get(pivoted_column)
-            .copied()
-            .unwrap_or(pivoted_column);
-        if original_column >= columns {
-            continue;
-        }
-        let scale = reference_norms
-            .get(original_column)
-            .copied()
-            .filter(|norm| *norm > f64::EPSILON)
-            .unwrap_or(1.0);
-
-        for row in 0..rank {
-            result[[row, original_column]] =
-                pivoted_r[[row, pivoted_column]] * Complex64::new(scale, 0.0);
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{Array2, ShapeBuilder, s};
+    use ndarray::{Array2, s};
     use num_complex::Complex64;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    use crate::linalg::lapack::{ZgemmTranspose, zgemm};
-    use crate::linalg::ops::normalized_random_unitary_matrix;
-    use crate::operator::{ConvectionDiffusionOperator, IdentityOperator, LinearOperator};
+    use crate::{
+        block_arnoldi::BlockViewExt,
+        linalg::ops::normalized_random_unitary_matrix,
+        operator::{ConvectionDiffusionOperator, IdentityOperator, LinearOperator},
+    };
 
-    use super::{frobenius_norm, run_block_arnoldi};
+    use super::run_arnoldi;
 
     #[test]
-    fn identity_operator_breaks_down_after_one_block() {
+    fn identity_operator_breaks_down_after_one_step() {
         let operator = IdentityOperator::new(4);
-        let start = Array2::from_shape_vec(
-            (4, 2),
-            vec![
-                Complex64::new(1.0, 0.0),
-                Complex64::ZERO,
-                Complex64::ZERO,
-                Complex64::ZERO,
-                Complex64::ZERO,
-                Complex64::new(1.0, 0.0),
-                Complex64::ZERO,
-                Complex64::ZERO,
-            ],
-        )
-        .unwrap();
+        let start = Array2::<Complex64>::eye(4);
         let mut matvec_count = 0;
-        let factorization = run_block_arnoldi(&operator, &start, 3, 1.0e-12, &mut matvec_count)
-            .expect("block Arnoldi should handle an invariant start block");
+        let factorization = run_arnoldi(&operator, &start, 3, 1.0e-14, &mut matvec_count)
+            .expect("Arnoldi factorization should succeed");
 
-        assert_eq!(factorization.performed_blocks, 1);
-        assert_eq!(factorization.krylov_dimension(), 2);
+        assert_eq!(factorization.performed_steps, 1);
         assert!(factorization.happy_breakdown);
-        assert_eq!(matvec_count, 2);
+        assert_eq!(matvec_count, 4);
     }
 
     #[test]
-    fn block_factorization_satisfies_arnoldi_relation() {
-        let operator = ConvectionDiffusionOperator::new(4, 0.0);
+    fn arnoldi_factorization_preserves_relation_and_orthogonality() {
+        let operator = ConvectionDiffusionOperator::new(10, 100.0);
         let mut rng = StdRng::seed_from_u64(0);
-        let start = normalized_random_unitary_matrix(operator.dimension(), 2, &mut rng).unwrap();
+        let block_size = 5;
+        let start =
+            normalized_random_unitary_matrix(operator.dimension(), block_size, &mut rng).unwrap();
+        let target_steps = 3;
         let mut matvec_count = 0;
         let factorization =
-            run_block_arnoldi(&operator, &start, 4, 1.0e-12, &mut matvec_count).unwrap();
+            run_arnoldi(&operator, &start, target_steps, 1.0e-15, &mut matvec_count)
+                .expect("Arnoldi factorization should succeed");
 
-        let k = factorization.krylov_dimension();
-        let total = factorization.total_basis_columns();
-        let q = factorization.basis.slice(s![.., 0..k]).to_owned();
-        let q_bar = factorization.basis.slice(s![.., 0..total]).to_owned();
-        let h_bar = factorization
-            .hessenberg
-            .slice(s![0..total, 0..k])
-            .to_owned();
+        assert_eq!(factorization.performed_steps, target_steps);
+        assert!(!factorization.happy_breakdown);
 
-        let mut aq = Array2::zeros((operator.dimension(), k).f());
-        operator.apply_block_into(q.view(), aq.view_mut()).unwrap();
-        let qh = zgemm(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            q_bar.view(),
-            h_bar.view(),
-        );
-        let relation_error = frobenius_norm((aq - qh).view());
-        assert!(relation_error < 1.0e-8, "relation_error={relation_error}");
+        let mut lhs = Array2::zeros((operator.dimension(), (target_steps) * block_size));
+        operator
+            .apply_block_into(
+                factorization
+                    .basis
+                    .slice(s![.., ..(target_steps) * block_size]),
+                lhs.view_mut(),
+            )
+            .unwrap();
 
-        let gram = zgemm(
-            ZgemmTranspose::ConjugateTranspose,
-            ZgemmTranspose::None,
-            q_bar.view(),
-            q_bar.view(),
-        );
-        let mut identity = Array2::zeros((total, total).f());
-        for i in 0..total {
-            identity[[i, i]] = Complex64::new(1.0, 0.0);
-        }
-        let orthogonality_error = frobenius_norm((gram - identity).view());
+        let rhs = factorization.basis.dot(&factorization.hessenberg);
+        let lhs_norm = lhs.norm_f();
+        let relation_error = (lhs - rhs).norm_f();
+        let relative_relation_error = relation_error / lhs_norm.max(1.0);
         assert!(
-            orthogonality_error < 1.0e-8,
-            "orthogonality_error={orthogonality_error}"
+            relative_relation_error < 1.0e-12,
+            "relative_relation_error={relative_relation_error}, relation_error={relation_error}, lhs_norm={lhs_norm}",
+        );
+
+        let total_basis_columns = (target_steps + 1) * block_size;
+        let gram = factorization
+            .basis
+            .t()
+            .mapv(|entry| entry.conj())
+            .dot(&factorization.basis);
+        let identity = Array2::<Complex64>::eye(total_basis_columns);
+        let identity_norm = identity.norm_f();
+        let orthogonality_error = (gram - identity).norm_f();
+        let relative_orthogonality_error = orthogonality_error / identity_norm.max(1.0);
+        assert!(
+            relative_orthogonality_error < 1.0e-12,
+            "relative_orthogonality_error={relative_orthogonality_error}, orthogonality_error={orthogonality_error}",
         );
     }
 }

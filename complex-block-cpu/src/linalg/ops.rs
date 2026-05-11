@@ -13,7 +13,7 @@ pub(crate) use crate::linalg::lapack::{
 };
 
 const REORTHOGONALIZATION_THRESHOLD: f64 = f64::EPSILON * 1000.0;
-const ORTHOGONALIZATION_LOSS_THRESHOLD: f64 = std::f64::consts::FRAC_1_SQRT_2;
+// const ORTHOGONALIZATION_LOSS_THRESHOLD: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OrthogonalizedBlock {
@@ -193,15 +193,15 @@ pub(crate) fn orthogonalize_with_reorthogonalization<'a>(
         projection.view_mut(),
     );
 
-    let first_pass_norm = candidate.norm_f();
-    if first_pass_norm <= ORTHOGONALIZATION_LOSS_THRESHOLD * reference_norm {
-        project_candidate(
-            basis,
-            candidate.view_mut(),
-            h_column.view_mut(),
-            projection.view_mut(),
-        );
-    }
+    // let first_pass_norm = candidate.norm_f();
+    // if first_pass_norm <= ORTHOGONALIZATION_LOSS_THRESHOLD * reference_norm {
+    //     project_candidate(
+    //         basis,
+    //         candidate.view_mut(),
+    //         h_column.view_mut(),
+    //         projection.view_mut(),
+    //     );
+    // }
 
     let residual_qr =
         householder_qr_with_workspace(candidate.view(), &mut workspaces.residual_qr).unwrap();

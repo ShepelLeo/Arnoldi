@@ -145,7 +145,7 @@ pub fn solve_block(
             break;
         }
 
-        let target_blocks = config.ncv;
+        let target_blocks = restart_target_blocks(&config, operator.dimension(), converged)?;
         if retained_indices.is_empty()
             || retained_indices.len() >= target_blocks.saturating_mul(block_size)
         {
@@ -186,6 +186,21 @@ pub fn solve_block(
         history,
         note,
     })
+}
+
+fn restart_target_blocks(
+    config: &SolverConfig,
+    dimension: usize,
+    converged: usize,
+) -> Result<usize, IramError> {
+    let extra_blocks = converged.div_ceil(config.block_size);
+    let requested_blocks = config.ncv.checked_add(extra_blocks).ok_or_else(|| {
+        IramError::InvalidConfig("ncv + ceil(converged / block_size) overflows usize".to_string())
+    })?;
+    let max_full_blocks = dimension / config.block_size;
+    let max_target_blocks = max_full_blocks.saturating_sub(1);
+
+    Ok(requested_blocks.min(max_target_blocks))
 }
 
 fn orthonormal_start_block(
@@ -520,7 +535,7 @@ mod tests {
     use crate::linalg::ops::normalized_random_unitary_matrix;
     use crate::operator::{FnOperator, IdentityOperator};
 
-    use super::solve_block;
+    use super::{restart_target_blocks, solve_block};
 
     #[test]
     fn identity_operator_converges_for_full_start_block() {
@@ -625,5 +640,31 @@ mod tests {
             report.converged, report.total_restarts, report.note,
         );
         assert_eq!(report.converged, 4);
+    }
+
+    #[test]
+    fn restart_target_grows_with_converged_space() {
+        let config = SolverConfig {
+            nev: 10,
+            block_size: 1,
+            ncv: 20,
+            max_restarts: 100,
+            tol: 1.0e-10,
+            breakdown_tol: 1.0e-12,
+            ritz_inflation: 1.0,
+            target: SpectrumTarget::LargestMagnitude,
+        };
+
+        assert_eq!(restart_target_blocks(&config, 100, 0).unwrap(), 20);
+        assert_eq!(restart_target_blocks(&config, 100, 5).unwrap(), 25);
+
+        let block_config = SolverConfig {
+            block_size: 4,
+            ncv: 8,
+            ..config
+        };
+        assert_eq!(restart_target_blocks(&block_config, 100, 1).unwrap(), 9);
+        assert_eq!(restart_target_blocks(&block_config, 100, 4).unwrap(), 9);
+        assert_eq!(restart_target_blocks(&block_config, 100, 5).unwrap(), 10);
     }
 }

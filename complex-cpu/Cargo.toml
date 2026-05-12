@@ -1,5 +1,5 @@
 [package]
-name = "complex-cpu"
+name = "sandbox-gpu"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
@@ -13,9 +13,6 @@ nalgebra = "0.34"
 ndarray = { version = "0.17", features = ["rayon"] }
 num-complex = "0.4"
 rand = { version = "0.10", features = ["std_rng"] }
-lapack = "0.20"
-#lapack-src = { version = "0.13", features = ["openblas"] }
-#openblas-src = { version = "0.10", features = ["static"] }
 
 [profile.release]
 opt-level = 3

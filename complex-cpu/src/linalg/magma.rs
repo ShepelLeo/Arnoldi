@@ -1,6 +1,9 @@
 use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder};
 use num_complex::Complex64;
+use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
+use std::ptr;
+use std::sync::Once;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ZgemvTranspose {
@@ -18,9 +21,9 @@ pub enum ZgemmTranspose {
 pub struct SchurOutput {
     /// Eigenvalues.
     pub w: Vec<Complex64>,
-    /// Schur form T in LAPACK/Fortran column-major layout.
+    /// Work matrix in Fortran column-major layout.
     pub t: Vec<Complex64>,
-    /// Schur vectors Z in LAPACK/Fortran column-major layout.
+    /// Right eigenvectors in Fortran column-major layout.
     pub z: Vec<Complex64>,
 }
 
@@ -35,10 +38,206 @@ pub struct HouseholderQrOutput {
 pub enum SchurError {
     NotSquare,
     BadIloIhi,
-    LapackIllegalArgument(i32),
+    MagmaIllegalArgument(i32),
     NoConvergence(i32),
     DimensionMismatch,
     InvalidEigenIndex(usize),
+}
+
+type MagmaQueue = *mut c_void;
+
+const MAGMA_NO_TRANS: c_int = 111;
+const MAGMA_CONJ_TRANS: c_int = 113;
+const MAGMA_NO_VEC: c_int = 301;
+const MAGMA_VEC: c_int = 302;
+const MAGMA_SUCCESS: c_int = 0;
+const MAGMA_FUNC: *const c_char = b"rust\0".as_ptr().cast();
+const MAGMA_FILE: *const c_char = b"src/linalg/magma.rs\0".as_ptr().cast();
+
+static MAGMA_INIT: Once = Once::new();
+
+unsafe extern "C" {
+    fn magma_init() -> c_int;
+    fn magma_getdevice(device: *mut c_int);
+    fn magma_queue_create_internal(
+        device: c_int,
+        queue_ptr: *mut MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
+    );
+    fn magma_queue_destroy_internal(
+        queue: MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
+    );
+    fn magma_malloc(ptr_ptr: *mut *mut c_void, bytes: usize) -> c_int;
+    fn magma_free_internal(
+        ptr: *mut c_void,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
+    ) -> c_int;
+    fn magma_zsetmatrix(
+        m: c_int,
+        n: c_int,
+        h_a: *const Complex64,
+        lda: c_int,
+        d_a: *mut Complex64,
+        ldda: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zgetmatrix(
+        m: c_int,
+        n: c_int,
+        d_a: *const Complex64,
+        ldda: c_int,
+        h_a: *mut Complex64,
+        lda: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zsetvector(
+        n: c_int,
+        h_x: *const Complex64,
+        incx: c_int,
+        d_x: *mut Complex64,
+        incx_dev: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zgetvector(
+        n: c_int,
+        d_x: *const Complex64,
+        incx_dev: c_int,
+        h_x: *mut Complex64,
+        incx: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zgemm(
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: Complex64,
+        d_a: *const Complex64,
+        ldda: c_int,
+        d_b: *const Complex64,
+        lddb: c_int,
+        beta: Complex64,
+        d_c: *mut Complex64,
+        lddc: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zgemv(
+        trans: c_int,
+        m: c_int,
+        n: c_int,
+        alpha: Complex64,
+        d_a: *const Complex64,
+        ldda: c_int,
+        d_x: *const Complex64,
+        incx: c_int,
+        beta: Complex64,
+        d_y: *mut Complex64,
+        incy: c_int,
+        queue: MagmaQueue,
+    );
+    fn magma_zgeev(
+        jobvl: c_int,
+        jobvr: c_int,
+        n: c_int,
+        a: *mut Complex64,
+        lda: c_int,
+        w: *mut Complex64,
+        vl: *mut Complex64,
+        ldvl: c_int,
+        vr: *mut Complex64,
+        ldvr: c_int,
+        work: *mut Complex64,
+        lwork: c_int,
+        rwork: *mut f64,
+        info: *mut c_int,
+    ) -> c_int;
+    fn magma_zgeqrf(
+        m: c_int,
+        n: c_int,
+        a: *mut Complex64,
+        lda: c_int,
+        tau: *mut Complex64,
+        work: *mut Complex64,
+        lwork: c_int,
+        info: *mut c_int,
+    ) -> c_int;
+    fn magma_zungqr2(
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        a: *mut Complex64,
+        lda: c_int,
+        tau: *mut Complex64,
+        info: *mut c_int,
+    ) -> c_int;
+}
+
+struct Queue {
+    raw: MagmaQueue,
+}
+
+impl Queue {
+    fn new() -> Self {
+        ensure_magma_initialized();
+        let mut device = 0;
+        let mut raw = ptr::null_mut();
+        unsafe {
+            magma_getdevice(&mut device);
+            magma_queue_create_internal(device, &mut raw, MAGMA_FUNC, MAGMA_FILE, line!() as c_int);
+        }
+        assert!(!raw.is_null(), "magma_queue_create returned a null queue");
+        Self { raw }
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        unsafe {
+            magma_queue_destroy_internal(self.raw, MAGMA_FUNC, MAGMA_FILE, line!() as c_int);
+        }
+    }
+}
+
+struct DeviceBuffer {
+    ptr: *mut Complex64,
+}
+
+impl DeviceBuffer {
+    fn new(len: usize) -> Self {
+        ensure_magma_initialized();
+        let mut ptr = ptr::null_mut();
+        let bytes = len
+            .checked_mul(std::mem::size_of::<Complex64>())
+            .expect("MAGMA allocation size overflow");
+        let status = unsafe { magma_malloc(&mut ptr, bytes) };
+        assert_eq!(status, MAGMA_SUCCESS, "magma_malloc failed with status {status}");
+        Self {
+            ptr: ptr.cast::<Complex64>(),
+        }
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            magma_free_internal(self.ptr.cast::<c_void>(), MAGMA_FUNC, MAGMA_FILE, line!() as c_int);
+        }
+    }
+}
+
+fn ensure_magma_initialized() {
+    MAGMA_INIT.call_once(|| {
+        let status = unsafe { magma_init() };
+        assert_eq!(status, MAGMA_SUCCESS, "magma_init failed with status {status}");
+    });
 }
 
 #[inline]
@@ -46,10 +245,10 @@ fn zero() -> Complex64 {
     Complex64::ZERO
 }
 
-/// Copies an ndarray row-major/strided matrix into LAPACK column-major storage.
+/// Copies an ndarray row-major/strided matrix into Fortran column-major storage.
 ///
 /// This allocation is necessary unless the caller already owns a contiguous
-/// Fortran-order buffer, because LAPACK mutates its input in-place.
+/// Fortran-order buffer, because MAGMA mutates its input in-place.
 fn to_fortran_vec(a: &Array2<Complex64>) -> Vec<Complex64> {
     let (rows, cols) = a.dim();
     let mut out = Vec::with_capacity(rows * cols);
@@ -108,42 +307,10 @@ fn identity_fortran_vec(n: usize) -> Vec<Complex64> {
     z
 }
 
-unsafe extern "C" {
-    fn zgemm_(
-        transa: *const c_char,
-        transb: *const c_char,
-        m: *const c_int,
-        n: *const c_int,
-        k: *const c_int,
-        alpha: *const Complex64,
-        a: *const Complex64,
-        lda: *const c_int,
-        b: *const Complex64,
-        ldb: *const c_int,
-        beta: *const Complex64,
-        c: *mut Complex64,
-        ldc: *const c_int,
-    );
-
-    fn zgemv_(
-        trans: *const c_char,
-        m: *const c_int,
-        n: *const c_int,
-        alpha: *const Complex64,
-        a: *const Complex64,
-        lda: *const c_int,
-        x: *const Complex64,
-        incx: *const c_int,
-        beta: *const Complex64,
-        y: *mut Complex64,
-        incy: *const c_int,
-    );
-}
-
-fn trans_char(trans: ZgemmTranspose) -> c_char {
+fn magma_trans(trans: ZgemmTranspose) -> c_int {
     match trans {
-        ZgemmTranspose::None => b'N' as c_char,
-        ZgemmTranspose::ConjugateTranspose => b'C' as c_char,
+        ZgemmTranspose::None => MAGMA_NO_TRANS,
+        ZgemmTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
     }
 }
 
@@ -204,28 +371,76 @@ pub fn zgemm(
     let ldc = a_effective_rows.max(1) as c_int;
     let alpha = Complex64::new(1.0, 0.0);
     let beta = Complex64::ZERO;
-    let transa = trans_char(trans_a);
-    let transb = trans_char(trans_b);
+    let transa = magma_trans(trans_a);
+    let transb = magma_trans(trans_b);
+
+    if m == 0 || n == 0 {
+        return result;
+    }
+    if k == 0 {
+        return result;
+    }
+
+    let queue = Queue::new();
+    let d_a = DeviceBuffer::new(a_memory.len());
+    let d_b = DeviceBuffer::new(b_memory.len());
+    let d_c = DeviceBuffer::new(result_memory.len());
 
     unsafe {
-        zgemm_(
-            &transa,
-            &transb,
-            &m,
-            &n,
-            &k,
-            &alpha,
+        magma_zsetmatrix(
+            a_rows as c_int,
+            a_columns as c_int,
             a_memory.as_ptr(),
-            &lda,
-            b_memory.as_ptr(),
-            &ldb,
-            &beta,
-            result_memory.as_mut_ptr(),
-            &ldc,
+            lda,
+            d_a.ptr,
+            lda,
+            queue.raw,
         );
+        magma_zsetmatrix(
+            b_rows as c_int,
+            b_columns as c_int,
+            b_memory.as_ptr(),
+            ldb,
+            d_b.ptr,
+            ldb,
+            queue.raw,
+        );
+        magma_zsetmatrix(m, n, result_memory.as_ptr(), ldc, d_c.ptr, ldc, queue.raw);
+        magma_zgemm(
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha,
+            d_a.ptr,
+            lda,
+            d_b.ptr,
+            ldb,
+            beta,
+            d_c.ptr,
+            ldc,
+            queue.raw,
+        );
+        magma_zgetmatrix(m, n, d_c.ptr, ldc, result_memory.as_mut_ptr(), ldc, queue.raw);
     }
 
     result
+}
+
+fn scale_slice(values: &mut [Complex64], beta: Complex64) {
+    if beta == Complex64::ZERO {
+        values.fill(Complex64::ZERO);
+    } else {
+        values.iter_mut().for_each(|value| *value *= beta);
+    }
+}
+
+fn magma_trans_from_zgemv(trans: ZgemvTranspose) -> c_int {
+    match trans {
+        ZgemvTranspose::None => MAGMA_NO_TRANS,
+        ZgemvTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
+    }
 }
 
 pub fn zgemv(
@@ -250,104 +465,72 @@ pub fn zgemv(
         .as_slice_memory_order()
         .expect("zgemv expects contiguous matrix storage");
 
-    let (trans_char, x_len, y_len) = match trans {
-        ZgemvTranspose::None => (b'N' as c_char, columns, rows),
-        ZgemvTranspose::ConjugateTranspose => (b'C' as c_char, rows, columns),
+    let (x_len, y_len) = match trans {
+        ZgemvTranspose::None => (columns, rows),
+        ZgemvTranspose::ConjugateTranspose => (rows, columns),
     };
     assert_eq!(x.len(), x_len);
     assert_eq!(y.len(), y_len);
 
+    if y_len == 0 {
+        return;
+    }
+    if x_len == 0 {
+        scale_slice(y, beta);
+        return;
+    }
+
     let rows_i = rows as c_int;
     let columns_i = columns as c_int;
-    let lda = rows_i;
+    let lda = rows_i.max(1);
     let incx = 1 as c_int;
     let incy = 1 as c_int;
+    let trans = magma_trans_from_zgemv(trans);
+
+    let queue = Queue::new();
+    let d_a = DeviceBuffer::new(matrix_column_major.len());
+    let d_x = DeviceBuffer::new(x.len());
+    let d_y = DeviceBuffer::new(y.len());
 
     unsafe {
-        zgemv_(
-            &trans_char,
-            &rows_i,
-            &columns_i,
-            &alpha,
+        magma_zsetmatrix(
+            rows_i,
+            columns_i,
             matrix_column_major.as_ptr(),
-            &lda,
-            x.as_ptr(),
-            &incx,
-            &beta,
-            y.as_mut_ptr(),
-            &incy,
+            lda,
+            d_a.ptr,
+            lda,
+            queue.raw,
         );
+        magma_zsetvector(x_len as c_int, x.as_ptr(), incx, d_x.ptr, incx, queue.raw);
+        magma_zsetvector(y_len as c_int, y.as_ptr(), incy, d_y.ptr, incy, queue.raw);
+        magma_zgemv(
+            trans,
+            rows_i,
+            columns_i,
+            alpha,
+            d_a.ptr,
+            lda,
+            d_x.ptr,
+            incx,
+            beta,
+            d_y.ptr,
+            incy,
+            queue.raw,
+        );
+        magma_zgetvector(y_len as c_int, d_y.ptr, incy, y.as_mut_ptr(), incy, queue.raw);
     }
 }
 
 pub fn zhseqr_schur(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
-    let (n, m) = h.dim();
-    if n != m {
-        return Err(SchurError::NotSquare);
-    }
-
-    if n == 0 {
-        return Ok(SchurOutput {
-            w: Vec::new(),
-            t: Vec::new(),
-            z: Vec::new(),
-        });
-    }
-
-    let n_i = n as i32;
-    let ilo = 1_i32;
-    let ihi = n_i;
-
-    let mut h_col = to_fortran_vec(h);
-    let mut w = vec![zero(); n];
-    let mut z = vec![zero(); n * n];
-
-    let mut work_query = [zero(); 1];
-    let mut info = 0_i32;
-
-    unsafe {
-        lapack::zhseqr(
-            b'S',
-            b'I',
-            n_i,
-            ilo,
-            ihi,
-            &mut h_col,
-            n_i,
-            &mut w,
-            &mut z,
-            n_i,
-            &mut work_query,
-            -1,
-            &mut info,
-        );
-    }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
-    }
-
-    let lwork = (work_query[0].re as i32).max(n_i).max(1);
-    let mut work = vec![zero(); lwork as usize];
-
-    unsafe {
-        lapack::zhseqr(
-            b'S', b'I', n_i, ilo, ihi, &mut h_col, n_i, &mut w, &mut z, n_i, &mut work, lwork,
-            &mut info,
-        );
-    }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
-    }
-    if info > 0 {
-        return Err(SchurError::NoConvergence(info));
-    }
-
-    Ok(SchurOutput { w, t: h_col, z })
+    magma_zgeev_right(h)
 }
 
 pub fn zgees_schur(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+    magma_zgeev_right(a)
+}
+
+fn magma_zgeev_right(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
     let (n, m) = a.dim();
     if n != m {
         return Err(SchurError::NotSquare);
@@ -361,55 +544,67 @@ pub fn zgees_schur(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
         });
     }
 
-    let n_i = n as i32;
+    ensure_magma_initialized();
+    let n_i = n as c_int;
     let mut a_col = to_fortran_vec(a);
     let mut w = vec![zero(); n];
+    let mut vl_dummy = [zero(); 1];
     let mut z = vec![zero(); n * n];
-    let mut rwork = vec![0.0; n];
-    let mut bwork = vec![0_i32; n];
-
-    let mut sdim = 0_i32;
+    let mut rwork = vec![0.0; 2 * n];
     let mut work_query = [zero(); 1];
     let mut info = 0_i32;
 
     unsafe {
-        lapack::zgees(
-            b'V',
-            b'N',
-            None,
+        magma_zgeev(
+            MAGMA_NO_VEC,
+            MAGMA_VEC,
             n_i,
-            &mut a_col,
+            a_col.as_mut_ptr(),
             n_i,
-            &mut sdim,
-            &mut w,
-            &mut z,
+            w.as_mut_ptr(),
+            vl_dummy.as_mut_ptr(),
+            1,
+            z.as_mut_ptr(),
             n_i,
-            &mut work_query,
+            work_query.as_mut_ptr(),
             -1,
-            &mut rwork,
-            &mut bwork,
+            rwork.as_mut_ptr(),
             &mut info,
         );
     }
 
     if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
+        return Err(SchurError::MagmaIllegalArgument(-info));
+    }
+    if info > 0 {
+        return Err(SchurError::NoConvergence(info));
     }
 
     let lwork = (work_query[0].re as i32).max(2 * n_i).max(1);
     let mut work = vec![zero(); lwork as usize];
-    let mut sdim = 0_i32;
     let mut info = 0_i32;
 
     unsafe {
-        lapack::zgees(
-            b'V', b'N', None, n_i, &mut a_col, n_i, &mut sdim, &mut w, &mut z, n_i, &mut work,
-            lwork, &mut rwork, &mut bwork, &mut info,
+        magma_zgeev(
+            MAGMA_NO_VEC,
+            MAGMA_VEC,
+            n_i,
+            a_col.as_mut_ptr(),
+            n_i,
+            w.as_mut_ptr(),
+            vl_dummy.as_mut_ptr(),
+            1,
+            z.as_mut_ptr(),
+            n_i,
+            work.as_mut_ptr(),
+            lwork,
+            rwork.as_mut_ptr(),
+            &mut info,
         );
     }
 
     if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
+        return Err(SchurError::MagmaIllegalArgument(-info));
     }
     if info > 0 {
         return Err(SchurError::NoConvergence(info));
@@ -437,49 +632,108 @@ pub fn ztrevc_right_selected(
         return Ok(Array2::zeros((dim, 0).f()));
     }
 
-    let mut select = vec![0_i32; dim];
-    for &j in indices {
-        select[j] = 1;
+    let mut select = vec![false; dim];
+    for &index in indices {
+        select[index] = true;
     }
 
-    let mm = indices.len() as i32;
-    let mut m_out = 0_i32;
+    let eigenvectors = fortran_view(dim, dim, &decomposition.z)?;
+    let selected_count = select.iter().filter(|&&flag| flag).count();
+    let mut selected = Array2::zeros((dim, selected_count).f());
+    let mut target_column = 0;
+    for (source_column, &is_selected) in select.iter().enumerate() {
+        if !is_selected {
+            continue;
+        }
+        selected
+            .column_mut(target_column)
+            .assign(&eigenvectors.column(source_column));
+        target_column += 1;
+    }
 
-    let mut vl_dummy = [zero(); 1];
-    let mut vr_sel = vec![zero(); dim * indices.len()];
-    let mut work = vec![zero(); 2 * dim];
-    let mut rwork = vec![0.0_f64; dim];
-    let mut info = 0_i32;
+    Ok(selected)
+}
 
+fn magma_zgeqrf_lwork(
+    m: c_int,
+    n: c_int,
+    a: &mut [Complex64],
+    lda: c_int,
+    tau: &mut [Complex64],
+) -> Result<c_int, String> {
+    ensure_magma_initialized();
+    let mut work_query = [zero(); 1];
+    let mut info = 0;
     unsafe {
-        lapack::ztrevc(
-            b'R',
-            b'S',
-            &select,
-            dim as i32,
-            &mut decomposition.t,
-            dim as i32,
-            &mut vl_dummy,
-            1,
-            &mut vr_sel,
-            dim as i32,
-            mm,
-            &mut m_out,
-            &mut work,
-            &mut rwork,
+        magma_zgeqrf(
+            m,
+            n,
+            a.as_mut_ptr(),
+            lda,
+            tau.as_mut_ptr(),
+            work_query.as_mut_ptr(),
+            -1,
             &mut info,
         );
     }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
+    if info != 0 {
+        return Err(format!("magma_zgeqrf workspace query failed, info = {info}"));
     }
 
-    let x_sel = fortran_view(dim, m_out as usize, &vr_sel)?;
-    let z = fortran_view(dim, dim, &decomposition.z)?;
+    Ok((work_query[0].re as c_int).max(n).max(1))
+}
 
-    // Единственная новая матрица здесь — результат Z * X.
-    Ok(z.dot(&x_sel))
+fn magma_zgeqrf_factor(
+    m: c_int,
+    n: c_int,
+    a: &mut [Complex64],
+    lda: c_int,
+    tau: &mut [Complex64],
+    work: &mut [Complex64],
+) -> Result<(), String> {
+    let mut info = 0;
+    unsafe {
+        magma_zgeqrf(
+            m,
+            n,
+            a.as_mut_ptr(),
+            lda,
+            tau.as_mut_ptr(),
+            work.as_mut_ptr(),
+            work.len() as c_int,
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return Err(format!("magma_zgeqrf failed, info = {info}"));
+    }
+    Ok(())
+}
+
+fn magma_zungqr_generate(
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    a: &mut [Complex64],
+    lda: c_int,
+    tau: &mut [Complex64],
+) -> Result<(), String> {
+    let mut info = 0;
+    unsafe {
+        magma_zungqr2(
+            m,
+            n,
+            k,
+            a.as_mut_ptr(),
+            lda,
+            tau.as_mut_ptr(),
+            &mut info,
+        );
+    }
+    if info != 0 {
+        return Err(format!("magma_zungqr2 failed, info = {info}"));
+    }
+    Ok(())
 }
 
 pub fn shifted_qr_filter(
@@ -535,43 +789,11 @@ fn zgeqrf_q(matrix: &Array2<Complex64>) -> Result<Array2<Complex64>, String> {
 
     let mut q = to_fortran_vec(matrix);
     let mut tau = vec![zero(); k as usize];
-    let mut work_query = [zero(); 1];
-    let mut info = 0;
-
-    unsafe {
-        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work_query, -1, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf workspace query failed, info = {}", info));
-    }
-
-    let lwork = (work_query[0].re as i32).max(1);
+    let lwork = magma_zgeqrf_lwork(m, n, &mut q, lda, &mut tau)?;
     let mut work = vec![zero(); lwork as usize];
 
-    unsafe {
-        lapack::zgeqrf(m, n, &mut q, lda, &mut tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf failed, info = {}", info));
-    }
-
-    work_query[0] = zero();
-    unsafe {
-        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work_query, -1, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zungqr workspace query failed, info = {}", info));
-    }
-
-    let lwork = (work_query[0].re as i32).max(1);
-    let mut work = vec![zero(); lwork as usize];
-
-    unsafe {
-        lapack::zungqr(m, n, k, &mut q, lda, &tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zungqr failed, info = {}", info));
-    }
+    magma_zgeqrf_factor(m, n, &mut q, lda, &mut tau, &mut work)?;
+    magma_zungqr_generate(m, n, k, &mut q, lda, &mut tau)?;
 
     Ok(from_fortran_vec(rows, cols, q))
 }
@@ -601,25 +823,10 @@ pub fn zgeqrf_qr_rank(
     let min_mn = rows.min(columns);
     let mut a = to_fortran_vec(matrix);
     let mut tau = vec![zero(); min_mn];
-    let mut work_query = [zero(); 1];
-    let mut info = 0;
-
-    unsafe {
-        lapack::zgeqrf(m, n, &mut a, lda, &mut tau, &mut work_query, -1, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf workspace query failed, info = {info}"));
-    }
-
-    let lwork = (work_query[0].re as i32).max(n).max(1);
+    let lwork = magma_zgeqrf_lwork(m, n, &mut a, lda, &mut tau)?;
     let mut work = vec![zero(); lwork as usize];
 
-    unsafe {
-        lapack::zgeqrf(m, n, &mut a, lda, &mut tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf failed, info = {info}"));
-    }
+    magma_zgeqrf_factor(m, n, &mut a, lda, &mut tau, &mut work)?;
 
     let diagonal = (0..min_mn)
         .map(|index| a[index + index * rows].norm())
@@ -649,34 +856,7 @@ pub fn zgeqrf_qr_rank(
     }
 
     let q_columns = min_mn as i32;
-    work_query[0] = zero();
-    unsafe {
-        lapack::zungqr(
-            m,
-            q_columns,
-            q_columns,
-            &mut a,
-            lda,
-            &tau,
-            &mut work_query,
-            -1,
-            &mut info,
-        );
-    }
-    if info != 0 {
-        return Err(format!("zungqr workspace query failed, info = {info}"));
-    }
-
-    let lwork = (work_query[0].re as i32).max(q_columns).max(1);
-    let mut work = vec![zero(); lwork as usize];
-    unsafe {
-        lapack::zungqr(
-            m, q_columns, q_columns, &mut a, lda, &tau, &mut work, lwork, &mut info,
-        );
-    }
-    if info != 0 {
-        return Err(format!("zungqr failed, info = {info}"));
-    }
+    magma_zungqr_generate(m, q_columns, q_columns, &mut a, lda, &mut tau)?;
 
     Ok(HouseholderQrOutput {
         q: copy_fortran_columns_to_array(rows, rank, &a),
@@ -731,38 +911,13 @@ pub fn last_r_col_without_diag_from_zgeqrf(
     let min_mn = m.min(n);
     let mut tau = vec![zero(); min_mn as usize];
 
-    let mut work_query = [zero(); 1];
-    let mut info = 0;
-
-    unsafe {
-        lapack::zgeqrf(
-            m,
-            n,
-            &mut mat,
-            lda,
-            &mut tau,
-            &mut work_query,
-            -1,
-            &mut info,
-        );
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf workspace query failed, info = {}", info));
-    }
-
-    let lwork = work_query[0].re as i32;
+    let lwork = magma_zgeqrf_lwork(m, n, &mut mat, lda, &mut tau)?;
     if lwork <= 0 {
-        return Err(format!("zgeqrf returned invalid lwork = {}", lwork));
+        return Err(format!("magma_zgeqrf returned invalid lwork = {}", lwork));
     }
 
     let mut work = vec![zero(); lwork as usize];
-
-    unsafe {
-        lapack::zgeqrf(m, n, &mut mat, lda, &mut tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf failed, info = {}", info));
-    }
+    magma_zgeqrf_factor(m, n, &mut mat, lda, &mut tau, &mut work)?;
 
     // R хранится в верхнем треугольнике mat. Последний столбец имеет offset k * lda.
     // Без диагонального элемента берём строки 0..rlen, где rlen = min(k, nrows).
@@ -779,7 +934,7 @@ mod tests {
     use num_complex::Complex64;
 
     #[test]
-    fn zgemv_wraps_column_major_blas() {
+    fn zgemv_wraps_column_major_magma() {
         let one = Complex64::new(1.0, 0.0);
         let zero = Complex64::ZERO;
         let a = Array2::from_shape_vec(
@@ -818,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn zgemm_wraps_column_major_blas() {
+    fn zgemm_wraps_column_major_magma() {
         let a = Array2::from_shape_vec(
             (2, 2).f(),
             vec![

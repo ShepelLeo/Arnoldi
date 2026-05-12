@@ -5,7 +5,7 @@ use num_complex::Complex64;
 use rand::{Rng, RngExt};
 
 use crate::error::IramError;
-use crate::linalg::lapack::{ZgemvTranspose, zgemv};
+use crate::linalg::magma::{ZgemvTranspose, zgemv};
 
 const REORTHOGONALIZATION_THRESHOLD: f64 = f64::EPSILON * 1000.0;
 

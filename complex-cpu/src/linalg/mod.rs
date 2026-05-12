@@ -1,3 +1,3 @@
-pub mod lapack;
+pub mod magma;
 pub mod ops;
 pub mod small;

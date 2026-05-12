@@ -6,9 +6,9 @@ use rand::{Rng, RngExt};
 
 use crate::block_arnoldi::BlockViewExt;
 use crate::error::IramError;
-use crate::linalg::lapack::{self, PivotedQrOutput, QrOutput, SchurError, SchurOutput};
+use crate::linalg::magma::{self, PivotedQrOutput, QrOutput, SchurError, SchurOutput};
 
-pub(crate) use crate::linalg::lapack::{
+pub(crate) use crate::linalg::magma::{
     DenseSchurWorkspace, HouseholderQrWorkspace, TrevcWorkspace, ZgemmTranspose, ZgemvTranspose,
 };
 
@@ -35,7 +35,7 @@ pub(crate) fn matvec_into(
     beta: Complex64,
     y: ArrayViewMut1<'_, Complex64>,
 ) {
-    lapack::zgemv_into(trans, matrix, alpha, x, beta, y);
+    magma::zgemv_into(trans, matrix, alpha, x, beta, y);
 }
 
 pub(crate) fn matmul(
@@ -81,35 +81,35 @@ pub(crate) fn matmul_into(
     beta: Complex64,
     output: ArrayViewMut2<'_, Complex64>,
 ) {
-    lapack::zgemm_into(trans_a, trans_b, alpha, left, right, beta, output);
+    magma::zgemm_into(trans_a, trans_b, alpha, left, right, beta, output);
 }
 
 pub(crate) fn householder_qr_with_workspace(
     matrix: ArrayView2<'_, Complex64>,
     workspace: &mut HouseholderQrWorkspace,
 ) -> Result<QrOutput, String> {
-    lapack::zgeqrf_qr_with_workspace(matrix, workspace)
+    magma::zgeqrf_qr_with_workspace(matrix, workspace)
 }
 
 pub(crate) fn householder_qr_owned_fortran_with_workspace(
     matrix: Array2<Complex64>,
     workspace: &mut HouseholderQrWorkspace,
 ) -> Result<QrOutput, String> {
-    lapack::zgeqrf_qr_owned_fortran_with_workspace(matrix, workspace)
+    magma::zgeqrf_qr_owned_fortran_with_workspace(matrix, workspace)
 }
 
 pub(crate) fn pivoted_qr_rank(
     matrix: &Array2<Complex64>,
     relative_tolerance: f64,
 ) -> Result<PivotedQrOutput, String> {
-    lapack::zgeqp3_qr_rank(matrix, relative_tolerance)
+    magma::zgeqp3_qr_rank(matrix, relative_tolerance)
 }
 
 pub(crate) fn dense_schur_with_workspace(
     matrix: ArrayView2<'_, Complex64>,
     workspace: &mut DenseSchurWorkspace,
 ) -> Result<SchurOutput, SchurError> {
-    lapack::zgees_schur_with_workspace(matrix, workspace)
+    magma::zgees_schur_with_workspace(matrix, workspace)
 }
 
 pub(crate) fn selected_ritz_vectors_with_workspace(
@@ -118,7 +118,7 @@ pub(crate) fn selected_ritz_vectors_with_workspace(
     dim: usize,
     workspace: &mut TrevcWorkspace,
 ) -> Result<Array2<Complex64>, SchurError> {
-    lapack::ztrevc_right_selected_with_workspace(decomposition, ritz_indices, dim, workspace)
+    magma::ztrevc_right_selected_with_workspace(decomposition, ritz_indices, dim, workspace)
 }
 
 /// Генерация случайной матрицы с ортонормальными столбцами.

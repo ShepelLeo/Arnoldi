@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use complex_block_cpu::config::{SolverConfig, SpectrumTarget};
-use complex_block_cpu::linalg::ops::normalized_random_unitary_matrix;
-use complex_block_cpu::memory;
-use complex_block_cpu::operator::{
+use complex_block_gpu::config::{SolverConfig, SpectrumTarget};
+use complex_block_gpu::linalg::ops::normalized_random_unitary_matrix;
+use complex_block_gpu::memory;
+use complex_block_gpu::operator::{
     ConvectionDiffusionOperator, GrcarOperator, IdentityOperator, LinearOperator,
     matrix_operator_from_text_file,
 };
-use complex_block_cpu::{IramError, solve_block};
+use complex_block_gpu::{IramError, solve_block};
 use ndarray::Array2;
 use num_complex::Complex64;
 use rand::SeedableRng;

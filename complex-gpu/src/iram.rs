@@ -6,7 +6,7 @@ use num_complex::Complex64;
 use crate::arnoldi::{ArnoldiFactorization, continue_arnoldi, run_arnoldi};
 use crate::config::SolverConfig;
 use crate::error::IramError;
-use crate::linalg::lapack::*;
+use crate::linalg::magma::*;
 use crate::linalg::ops::{normalize, orthogonalize_with_reorthogonalization};
 use crate::linalg::small::{compute_ritz_values, retrive_ritz_vectors};
 use crate::memory;
@@ -134,7 +134,6 @@ pub fn solve(
             &factorization,
             &selection.shifts,
             config.ncv + converged,
-            //krylov_dim - selection.shifts.len() + converged,
             config.breakdown_tol,
             &mut total_matvecs,
             selection.wanted.len(),

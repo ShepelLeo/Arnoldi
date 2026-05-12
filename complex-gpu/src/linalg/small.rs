@@ -3,7 +3,7 @@
 use ndarray::{Array1, Array2};
 use num_complex::Complex64;
 
-use crate::linalg::lapack::*;
+use crate::linalg::magma::*;
 
 #[derive(Debug, Clone)]
 pub struct RitzValue {

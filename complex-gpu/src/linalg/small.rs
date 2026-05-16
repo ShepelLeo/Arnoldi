@@ -3,7 +3,9 @@
 use ndarray::{Array1, Array2};
 use num_complex::Complex64;
 
-use crate::linalg::magma::*;
+use crate::linalg::magma::{
+    SchurError, SchurOutput, select_right_eigenvectors, zgeev_right_eigenpairs,
+};
 
 #[derive(Debug, Clone)]
 pub struct RitzValue {
@@ -12,16 +14,25 @@ pub struct RitzValue {
     pub ritz_vector: Array1<Complex64>,
 }
 
-pub fn compute_ritz_values(hessenberg: &Array2<Complex64>) -> SchurOutput {
-    zhseqr_schur(hessenberg).unwrap()
+pub fn compute_ritz_values(hessenberg: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+    zgeev_right_eigenpairs(hessenberg)
 }
 
-pub fn retrive_ritz_vectors(
-    decomposition: &mut SchurOutput,
+pub fn retrieve_ritz_vectors(
+    decomposition: &SchurOutput,
     ritz_indices: &[usize],
     dim: usize,
-) -> Array2<Complex64> {
-    ztrevc_right_selected(decomposition, ritz_indices, dim).unwrap()
+) -> Result<Array2<Complex64>, SchurError> {
+    select_right_eigenvectors(decomposition, ritz_indices, dim)
+}
+
+/// Backward-compatible spelling alias. Prefer `retrieve_ritz_vectors`.
+pub fn retrive_ritz_vectors(
+    decomposition: &SchurOutput,
+    ritz_indices: &[usize],
+    dim: usize,
+) -> Result<Array2<Complex64>, SchurError> {
+    retrieve_ritz_vectors(decomposition, ritz_indices, dim)
 }
 
 #[cfg(test)]
@@ -38,7 +49,7 @@ mod tests {
             [Complex64::new(0.0, 0.0), Complex64::new(-3.0, 0.5)],
         ]);
 
-        let values = compute_ritz_values(&hessenberg);
+        let values = compute_ritz_values(&hessenberg).unwrap();
 
         assert_eq!(values.w.len(), 2);
         assert!(

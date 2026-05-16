@@ -19,11 +19,14 @@ pub enum ZgemmTranspose {
 
 #[derive(Debug)]
 pub struct SchurOutput {
-    /// Eigenvalues.
+    /// Eigenvalues in the same order as the columns of `z`.
     pub w: Vec<Complex64>,
-    /// Work matrix in Fortran column-major layout.
+    /// MAGMA work matrix in Fortran column-major layout.
+    ///
+    /// This is the input matrix after `magma_zgeev` has overwritten it. It is
+    /// kept for diagnostics/backward compatibility; it is not a Schur form.
     pub t: Vec<Complex64>,
-    /// Right eigenvectors in Fortran column-major layout.
+    /// Right eigenvectors in Fortran column-major layout, one eigenvector per column.
     pub z: Vec<Complex64>,
 }
 
@@ -43,6 +46,8 @@ const MAGMA_NO_TRANS: c_int = 111;
 const MAGMA_CONJ_TRANS: c_int = 113;
 const MAGMA_NO_VEC: c_int = 301;
 const MAGMA_VEC: c_int = 302;
+const MAGMA_RIGHT: c_int = 142;
+const MAGMA_BACKTRANS_VEC: c_int = 307;
 const MAGMA_SUCCESS: c_int = 0;
 const MAGMA_FUNC: *const c_char = b"rust\0".as_ptr().cast();
 const MAGMA_FILE: *const c_char = b"src/linalg/magma.rs\0".as_ptr().cast();
@@ -207,6 +212,25 @@ unsafe extern "C" {
         tau: *mut Complex64,
         work: *mut Complex64,
         lwork: MagmaInt,
+        info: *mut MagmaInt,
+    ) -> MagmaInt;
+
+    fn magma_ztrevc3_mt(
+        side: MagmaInt,
+        howmany: MagmaInt,
+        select: *mut MagmaInt,
+        n: MagmaInt,
+        t: *mut Complex64,
+        ldt: MagmaInt,
+        vl: *mut Complex64,
+        ldvl: MagmaInt,
+        vr: *mut Complex64,
+        ldvr: MagmaInt,
+        mm: MagmaInt,
+        mout: *mut MagmaInt,
+        work: *mut Complex64,
+        lwork: MagmaInt,
+        rwork: *mut f64,
         info: *mut MagmaInt,
     ) -> MagmaInt;
 }
@@ -841,8 +865,23 @@ fn scale_slice(values: &mut [Complex64], beta: Complex64) {
     }
 }
 
-pub fn zhseqr_schur(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+/// Computes eigenvalues and all right eigenvectors with MAGMA `zgeev`.
+///
+/// The input matrix is the small Arnoldi Hessenberg matrix. MAGMA in this build
+/// exports `magma_zgeev` and `magma_ztrevc3_mt`, but not a public
+/// `magma_zhseqr`; `zgeev` internally performs the Schur/eigenvector work.
+/// Therefore this routine intentionally exposes the result as eigenpairs, not as
+/// a true Schur decomposition.
+pub fn zgeev_right_eigenpairs(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
     magma_zgeev_right(h)
+}
+
+/// Backward-compatible alias for older call sites.
+///
+/// Despite the historical name, this does not call `zhseqr` and `SchurOutput.t`
+/// is not a Schur form. Prefer `zgeev_right_eigenpairs`.
+pub fn zhseqr_schur(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
+    zgeev_right_eigenpairs(h)
 }
 
 fn magma_zgeev_right(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
@@ -933,7 +972,22 @@ pub fn ztrevc_right_selected(
     indices: &[usize],
     dim: usize,
 ) -> Result<Array2<Complex64>, SchurError> {
-    if decomposition.t.len() != dim * dim || decomposition.z.len() != dim * dim {
+    select_right_eigenvectors(decomposition, indices, dim)
+}
+
+/// Selects right eigenvector columns from `SchurOutput.z` in exactly the order
+/// requested by `indices`.
+///
+/// The previous implementation built a boolean mask and returned columns in
+/// ascending eigenvalue index order. IRAM then paired those columns with
+/// `selection.wanted` order, which could attach a residual estimate to the wrong
+/// Ritz value.
+pub fn select_right_eigenvectors(
+    decomposition: &SchurOutput,
+    indices: &[usize],
+    dim: usize,
+) -> Result<Array2<Complex64>, SchurError> {
+    if decomposition.z.len() != dim * dim {
         return Err(SchurError::DimensionMismatch);
     }
 
@@ -947,26 +1001,83 @@ pub fn ztrevc_right_selected(
         return Ok(Array2::zeros((dim, 0).f()));
     }
 
-    let mut select = vec![false; dim];
-    for &index in indices {
-        select[index] = true;
-    }
-
     let eigenvectors = fortran_view(dim, dim, &decomposition.z)?;
-    let selected_count = select.iter().filter(|&&flag| flag).count();
-    let mut selected = Array2::zeros((dim, selected_count).f());
-    let mut target_column = 0;
-    for (source_column, &is_selected) in select.iter().enumerate() {
-        if !is_selected {
-            continue;
-        }
+    let mut selected = Array2::zeros((dim, indices.len()).f());
+    for (target_column, &source_column) in indices.iter().enumerate() {
         selected
             .column_mut(target_column)
             .assign(&eigenvectors.column(source_column));
-        target_column += 1;
     }
 
     Ok(selected)
+}
+
+/// Computes all right eigenvectors of a true Schur form `T`, optionally
+/// back-transformed by Schur vectors `Q`, using `magma_ztrevc3_mt`.
+///
+/// This is not used by `zgeev_right_eigenpairs`, because that routine already
+/// obtains eigenvectors from MAGMA's `zgeev` driver. It is provided for the
+/// future path `CPU/LAPACK zhseqr -> MAGMA ztrevc3_mt`, where `t` is a true
+/// Schur form and `q` contains the Schur vectors.
+pub fn ztrevc3_right_backtrans_all(
+    t: &[Complex64],
+    q: &[Complex64],
+    dim: usize,
+) -> Result<Array2<Complex64>, SchurError> {
+    if t.len() != dim * dim || q.len() != dim * dim {
+        return Err(SchurError::DimensionMismatch);
+    }
+    if dim == 0 {
+        return Ok(Array2::zeros((0, 0).f()));
+    }
+
+    ensure_magma_initialized();
+
+    let n_i = dim as c_int;
+    let mut t_work = t.to_vec();
+    let mut right_vectors = q.to_vec();
+    let mut left_dummy = vec![zero(); 1];
+    let mut mout = 0_i32;
+
+    // MAGMA requires at least 2*n workspace. A larger workspace enables the
+    // blocked Level-3 path in ztrevc3_mt.
+    let lwork = ((1 + 2 * 64) * dim).max(2 * dim).max(1) as c_int;
+    let mut work = vec![zero(); lwork as usize];
+    let mut rwork = vec![0.0; dim.max(1)];
+    let mut info = 0_i32;
+
+    unsafe {
+        magma_ztrevc3_mt(
+            MAGMA_RIGHT,
+            MAGMA_BACKTRANS_VEC,
+            ptr::null_mut(),
+            n_i,
+            t_work.as_mut_ptr(),
+            n_i,
+            left_dummy.as_mut_ptr(),
+            1,
+            right_vectors.as_mut_ptr(),
+            n_i,
+            n_i,
+            &mut mout,
+            work.as_mut_ptr(),
+            lwork,
+            rwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+
+    if info < 0 {
+        return Err(SchurError::MagmaIllegalArgument(-info));
+    }
+    if info > 0 {
+        return Err(SchurError::NoConvergence(info));
+    }
+    if mout != n_i {
+        return Err(SchurError::DimensionMismatch);
+    }
+
+    Ok(from_fortran_vec(dim, dim, right_vectors))
 }
 
 fn magma_zgeqrf_lwork(
@@ -1400,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn zhseqr_schur_smoke_test() {
+    fn zgeev_right_eigenpairs_smoke_test() {
         let h = array![
             [
                 Complex64::new(1.0, 0.0),
@@ -1419,7 +1530,7 @@ mod tests {
             ],
         ];
 
-        let mut out = zhseqr_schur(&h).unwrap();
+        let mut out = zgeev_right_eigenpairs(&h).unwrap();
         println!("{:?}", out.t);
         println!("{:?}\n\n", out.w);
         let vecs = ztrevc_right_selected(&mut out, &[0, 1], 3);

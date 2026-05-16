@@ -8,7 +8,7 @@ use crate::config::SolverConfig;
 use crate::error::IramError;
 use crate::linalg::magma::*;
 use crate::linalg::ops::{normalize, orthogonalize_with_reorthogonalization};
-use crate::linalg::small::{compute_ritz_values, retrive_ritz_vectors};
+use crate::linalg::small::{compute_ritz_values, retrieve_ritz_vectors};
 use crate::memory;
 use crate::operator::LinearOperator;
 use crate::report::{IterationLog, RitzEstimate, SolveReport};
@@ -51,7 +51,9 @@ pub fn solve(
         let trailing_subdiagonal = factorization.trailing_subdiagonal();
 
         // Малая спектральная задача
-        let mut hessenberg_schur = compute_ritz_values(&square_hessenberg);
+        let hessenberg_schur = compute_ritz_values(&square_hessenberg).map_err(|error| {
+            IramError::Spectral(format!("small Ritz problem failed: {error:?}"))
+        })?;
 
         // Выбираем желаемые СЗН матрицы Хессенберга
         let selection = select_ritz_values(
@@ -62,9 +64,10 @@ pub fn solve(
             config.ritz_inflation,
         )?;
 
-        let ritz_vectors =
-            retrive_ritz_vectors(&mut hessenberg_schur, &selection.wanted, krylov_dim);
-
+        let ritz_vectors = retrieve_ritz_vectors(&hessenberg_schur, &selection.wanted, krylov_dim)
+            .map_err(|error| {
+                IramError::Spectral(format!("Ritz vector extraction failed: {error:?}"))
+            })?;
 
         let result: Vec<RitzEstimate> = selection.wanted
             .iter()

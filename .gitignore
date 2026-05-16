@@ -43,7 +43,11 @@ tmp/
 temp/
 
 
+**/*.txt
+**/*.err
+**/*.out
 **/*/convdiff_report.txt
+**/convdiff_report.txt
 convdiff_report.txt
 */convdiff_report.txt
 */complex-cpu/convdiff_report.txt

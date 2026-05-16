@@ -5,6 +5,8 @@ use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::sync::Once;
 
+use crate::memory;
+
 #[derive(Debug, Clone, Copy)]
 pub enum ZgemvTranspose {
     None,
@@ -370,6 +372,7 @@ impl Drop for Queue {
 
 struct DeviceBuffer {
     ptr: *mut Complex64,
+    bytes: usize,
 }
 
 impl DeviceBuffer {
@@ -381,8 +384,10 @@ impl DeviceBuffer {
             .expect("MAGMA allocation size overflow");
         let status = unsafe { magma_malloc(&mut ptr, bytes) };
         assert_eq!(status, MAGMA_SUCCESS, "magma_malloc failed with status {status}");
+        memory::record_device_allocation(bytes);
         Self {
             ptr: ptr.cast::<Complex64>(),
+            bytes,
         }
     }
 }
@@ -392,6 +397,7 @@ impl Drop for DeviceBuffer {
         unsafe {
             magma_free_internal(self.ptr.cast::<c_void>(), MAGMA_FUNC, MAGMA_FILE, line!() as c_int);
         }
+        memory::record_device_deallocation(self.bytes);
     }
 }
 
@@ -520,12 +526,23 @@ impl DeviceVector {
 
     pub fn copy_from_slice(&mut self, session: &MagmaSession, values: &[Complex64]) {
         assert_eq!(self.len, values.len());
-        if self.len == 0 {
+        self.copy_prefix_from_slice(session, values);
+    }
+
+    pub fn copy_to_slice(&self, session: &MagmaSession, values: &mut [Complex64]) {
+        assert_eq!(self.len, values.len());
+        self.copy_prefix_to_slice(session, values);
+    }
+
+    /// Uploads a prefix of this vector without reallocating the device buffer.
+    pub fn copy_prefix_from_slice(&mut self, session: &MagmaSession, values: &[Complex64]) {
+        assert!(values.len() <= self.len);
+        if values.is_empty() {
             return;
         }
         unsafe {
             magma_zsetvector(
-                self.len as c_int,
+                values.len() as c_int,
                 values.as_ptr(),
                 1,
                 self.buffer.ptr,
@@ -533,16 +550,18 @@ impl DeviceVector {
                 session.queue.raw,
             );
         }
+        memory::record_host_to_device_copy(values.len() * std::mem::size_of::<Complex64>());
     }
 
-    pub fn copy_to_slice(&self, session: &MagmaSession, values: &mut [Complex64]) {
-        assert_eq!(self.len, values.len());
-        if self.len == 0 {
+    /// Downloads a prefix of this vector without reallocating host storage.
+    pub fn copy_prefix_to_slice(&self, session: &MagmaSession, values: &mut [Complex64]) {
+        assert!(values.len() <= self.len);
+        if values.is_empty() {
             return;
         }
         unsafe {
             magma_zgetvector(
-                self.len as c_int,
+                values.len() as c_int,
                 self.buffer.ptr,
                 1,
                 values.as_mut_ptr(),
@@ -550,6 +569,7 @@ impl DeviceVector {
                 session.queue.raw,
             );
         }
+        memory::record_device_to_host_copy(values.len() * std::mem::size_of::<Complex64>());
     }
 
     #[inline]
@@ -599,6 +619,7 @@ impl DeviceMatrix {
                     device.lda,
                     session.queue.raw,
                 );
+                memory::record_host_to_device_copy(rows * columns * std::mem::size_of::<Complex64>());
             }
         }
         device
@@ -624,6 +645,7 @@ impl DeviceMatrix {
                 session.queue.raw,
             );
         }
+        memory::record_device_to_host_copy(self.rows * self.columns * std::mem::size_of::<Complex64>());
     }
 
     pub fn zgemv(
@@ -639,8 +661,8 @@ impl DeviceMatrix {
             ZgemvTranspose::None => (self.columns, self.rows),
             ZgemvTranspose::ConjugateTranspose => (self.rows, self.columns),
         };
-        assert_eq!(x.len(), x_len);
-        assert_eq!(y.len(), y_len);
+        assert!(x.len() >= x_len, "device zgemv input buffer is too small");
+        assert!(y.len() >= y_len, "device zgemv output buffer is too small");
 
         if y_len == 0 {
             return;
@@ -702,6 +724,7 @@ impl DeviceMatrix {
                 1,
                 session.queue.raw,
             );
+            memory::record_host_to_device_copy(self.rows * std::mem::size_of::<Complex64>());
         }
     }
 
@@ -725,8 +748,8 @@ impl DeviceMatrix {
             ZgemvTranspose::None => (columns, self.rows),
             ZgemvTranspose::ConjugateTranspose => (self.rows, columns),
         };
-        assert_eq!(x.len(), x_len);
-        assert_eq!(y.len(), y_len);
+        assert!(x.len() >= x_len, "device zgemv input buffer is too small");
+        assert!(y.len() >= y_len, "device zgemv output buffer is too small");
 
         if y_len == 0 {
             return;
@@ -772,7 +795,8 @@ fn assert_column_major_contiguous(matrix: ArrayView2<'_, Complex64>, context: &s
         .expect("column-major matrix must be contiguous");
 }
 
-pub fn zgemm(
+pub fn zgemm_with_session(
+    session: &MagmaSession,
     trans_a: ZgemmTranspose,
     trans_b: ZgemmTranspose,
     a: ArrayView2<'_, Complex64>,
@@ -792,10 +816,9 @@ pub fn zgemm(
         return result;
     }
 
-    let session = MagmaSession::new();
-    let d_a = DeviceMatrix::from_column_major(&session, a);
-    let d_b = DeviceMatrix::from_column_major(&session, b);
-    let mut d_c = DeviceMatrix::new(a_effective_rows, b_effective_columns);
+    let d_a = DeviceMatrix::from_column_major(session, a);
+    let d_b = DeviceMatrix::from_column_major(session, b);
+    let d_c = DeviceMatrix::new(a_effective_rows, b_effective_columns);
 
     unsafe {
         magma_zgemm(
@@ -819,8 +842,18 @@ pub fn zgemm(
     let result_memory = result
         .as_slice_memory_order_mut()
         .expect("zgemm result must be contiguous");
-    d_c.copy_to_column_major(&session, result_memory);
+    d_c.copy_to_column_major(session, result_memory);
     result
+}
+
+pub fn zgemm(
+    trans_a: ZgemmTranspose,
+    trans_b: ZgemmTranspose,
+    a: ArrayView2<'_, Complex64>,
+    b: ArrayView2<'_, Complex64>,
+) -> Array2<Complex64> {
+    let session = MagmaSession::new();
+    zgemm_with_session(&session, trans_a, trans_b, a, b)
 }
 
 pub fn zgemv(

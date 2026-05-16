@@ -185,6 +185,8 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
     basis_columns: usize,
     candidate: &mut Array1<Complex64>,
     d_candidate: &mut DeviceVector,
+    d_projection: &mut DeviceVector,
+    projection: &mut [Complex64],
     h_column: &mut [Complex64],
     reference_norm: f64,
     breakdown_tol: f64,
@@ -194,6 +196,8 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
     assert!(n <= d_basis.columns());
     assert_eq!(candidate.len(), m);
     assert_eq!(d_candidate.len(), m);
+    assert!(d_projection.len() >= n);
+    assert!(projection.len() >= n);
     assert!(h_column.len() >= n);
 
     let one = Complex64::new(1.0, 0.0);
@@ -203,8 +207,7 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
     let x = candidate
         .as_slice_mut()
         .expect("candidate must be contiguous");
-    let mut d_projection = DeviceVector::new(n);
-    let mut projection = vec![Complex64::ZERO; n];
+    let projection = &mut projection[..n];
 
     for _ in 0..2 {
         d_basis.zgemv_leading_columns(
@@ -214,9 +217,9 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
             one,
             d_candidate,
             zero,
-            &mut d_projection,
+            d_projection,
         );
-        d_projection.copy_to_slice(session, &mut projection);
+        d_projection.copy_prefix_to_slice(session, projection);
 
         for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
             *h += p;
@@ -227,7 +230,7 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
             n,
             MagmaZgemvTranspose::None,
             minus_one,
-            &d_projection,
+            d_projection,
             one,
             d_candidate,
         );
@@ -253,11 +256,11 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
         one,
         d_candidate,
         zero,
-        &mut d_projection,
+        d_projection,
     );
-    d_projection.copy_to_slice(session, &mut projection);
+    d_projection.copy_prefix_to_slice(session, projection);
 
-    let correction_norm = norm2_slice(&projection);
+    let correction_norm = norm2_slice(projection);
 
     if correction_norm > REORTHOGONALIZATION_THRESHOLD {
         for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
@@ -269,7 +272,7 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
             n,
             MagmaZgemvTranspose::None,
             minus_one,
-            &d_projection,
+            d_projection,
             one,
             d_candidate,
         );

@@ -14,6 +14,8 @@ use crate::linalg::ops::{
 pub struct MagmaArnoldiWorkspace {
     d_basis: DeviceMatrix,
     d_candidate: DeviceVector,
+    d_projection: DeviceVector,
+    projection: Vec<Complex64>,
 }
 
 pub struct MagmaBackend {
@@ -50,6 +52,8 @@ impl Backend for MagmaBackend {
         Ok(MagmaArnoldiWorkspace {
             d_basis: DeviceMatrix::from_column_major(&self.session, basis.view()),
             d_candidate: DeviceVector::new(dimension),
+            d_projection: DeviceVector::new(basis.ncols()),
+            projection: vec![Complex64::ZERO; basis.ncols()],
         })
     }
 
@@ -76,6 +80,8 @@ impl Backend for MagmaBackend {
             basis_columns,
             candidate,
             &mut workspace.d_candidate,
+            &mut workspace.d_projection,
+            &mut workspace.projection[..basis_columns],
             h_column,
             reference_norm,
             breakdown_tol,
@@ -142,6 +148,6 @@ impl Backend for MagmaBackend {
         a: ArrayView2<'_, Complex64>,
         b: ArrayView2<'_, Complex64>,
     ) -> Array2<Complex64> {
-        magma::zgemm(ZgemmTranspose::None, ZgemmTranspose::None, a, b)
+        magma::zgemm_with_session(&self.session, ZgemmTranspose::None, ZgemmTranspose::None, a, b)
     }
 }

@@ -18,6 +18,10 @@ pub struct IterationLog {
     pub converged: usize,
     pub total_matvecs: usize,
     pub peak_memory_bytes: usize,
+    pub peak_device_memory_bytes: usize,
+    pub device_allocations: usize,
+    pub host_to_device_bytes: usize,
+    pub device_to_host_bytes: usize,
     pub happy_breakdown: bool,
     pub wanted: Vec<RitzEstimate>,
     pub shifts: Vec<Complex64>,
@@ -33,6 +37,10 @@ pub struct SolveReport {
     pub total_restarts: usize,
     pub total_matvecs: usize,
     pub peak_memory_bytes: usize,
+    pub peak_device_memory_bytes: usize,
+    pub device_allocations: usize,
+    pub host_to_device_bytes: usize,
+    pub device_to_host_bytes: usize,
     pub converged: usize,
     pub fully_converged: bool,
     pub happy_breakdown: bool,
@@ -93,6 +101,33 @@ impl SolveReport {
         .ok();
         writeln!(
             &mut output,
+            "peak tracked device memory: {} bytes ({:.3} MiB)",
+            self.peak_device_memory_bytes,
+            self.peak_device_memory_bytes as f64 / (1024.0 * 1024.0),
+        )
+        .ok();
+        writeln!(
+            &mut output,
+            "device allocations: {}",
+            self.device_allocations,
+        )
+        .ok();
+        writeln!(
+            &mut output,
+            "host -> device transfers: {} bytes ({:.3} MiB)",
+            self.host_to_device_bytes,
+            self.host_to_device_bytes as f64 / (1024.0 * 1024.0),
+        )
+        .ok();
+        writeln!(
+            &mut output,
+            "device -> host transfers: {} bytes ({:.3} MiB)",
+            self.device_to_host_bytes,
+            self.device_to_host_bytes as f64 / (1024.0 * 1024.0),
+        )
+        .ok();
+        writeln!(
+            &mut output,
             "happy breakdown: {}",
             yes_no(self.happy_breakdown)
         )
@@ -133,12 +168,16 @@ impl SolveReport {
         self.history.iter().for_each(|log| {
             writeln!(
                 &mut output,
-                "restart {:>2}: krylov_dim={}, converged={}, matvecs={}, peak_memory={} bytes, happy_breakdown={}",
+                "restart {:>2}: krylov_dim={}, converged={}, matvecs={}, peak_memory={} bytes, peak_device_memory={} bytes, device_allocations={}, h2d={} bytes, d2h={} bytes, happy_breakdown={}",
                 log.restart,
                 log.krylov_dimension,
                 log.converged,
                 log.total_matvecs,
                 log.peak_memory_bytes,
+                log.peak_device_memory_bytes,
+                log.device_allocations,
+                log.host_to_device_bytes,
+                log.device_to_host_bytes,
                 yes_no(log.happy_breakdown),
             )
             .ok();

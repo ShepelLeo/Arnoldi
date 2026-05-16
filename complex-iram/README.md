@@ -48,3 +48,14 @@ src/
 The split follows the same broad idea as backend-oriented Rust frameworks: the high-level algorithm is generic over a backend interface, while execution details live in backend implementations. `iram.rs` and `arnoldi.rs` call operations such as `compute_ritz_values`, `retrieve_ritz_vectors`, `orthogonalize_arnoldi_candidate` and `zgemm_nn` through the `Backend` trait instead of directly calling LAPACK or MAGMA.
 
 The implicit restart filter `shifted_qr_filter` is now common in `linalg/shifted_qr.rs`. Both backends use the same host-side fast shifted QR implementation, so the two paths cannot silently diverge there.
+
+## MAGMA backend allocation/performance pass
+
+This version includes a conservative MAGMA optimization pass:
+
+- Arnoldi projection buffers are now stored in `MagmaArnoldiWorkspace` and reused across Arnoldi steps instead of allocating a fresh `DeviceVector` and host `Vec` on every orthogonalization.
+- `DeviceVector` supports prefix copies, so a projection buffer with capacity `ncv + 1` can serve the logical projection lengths `1..=ncv`.
+- `MagmaBackend::zgemm_nn` now uses the backend's long-lived `MagmaSession` via `zgemm_with_session`, avoiding a new MAGMA queue/session for restart GEMM calls.
+- MAGMA device allocation, device peak memory, and host/device transfer counters are recorded and rendered in the report.
+
+The CPU-side `LinearOperator::apply_into` contract is intentionally preserved in this pass. Moving matrix-vector products for Matrix Market operators to cuSPARSE/cuBLAS would be a larger backend-operator redesign and should be validated separately.

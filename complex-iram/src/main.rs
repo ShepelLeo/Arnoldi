@@ -50,8 +50,8 @@ struct Cli {
     breakdown_tol: f64,
 
     /// Расширение окружности для выбора Ritz-пар, удерживаемых на рестарте
-    #[arg(long, default_value_t = 1.0)]
-    ritz_inflation: f64,
+    #[arg(long)]
+    ritz_inflation: Option<f64>,
 
     /// Искомая часть спектра
     #[arg(long, value_enum, default_value_t = TargetArg::LargestMagnitude)]

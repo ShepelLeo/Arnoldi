@@ -1,20 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=complex-cpu
+#SBATCH --job-name=complex-gpu
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=24
+#SBATCH --gres=gpu:1
 #SBATCH --time=01:00:00
-#SBATCH --partition=c24m256
+#SBATCH --partition=gpu
 #SBATCH --output=slurm-%x.out
 #SBATCH --error=slurm-%x.err
 
-set -e
+# If your cluster uses newer Slurm GPU syntax instead of --gres,
+# replace the line above with:
+# #SBATCH --gpus=1
+
+set -euo pipefail
 
 echo "Start date: $(date)"
 echo "Node: $(hostname)"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Submit dir: $SLURM_SUBMIT_DIR"
+echo "Job ID: ${SLURM_JOB_ID:-manual}"
+echo "Submit dir: ${SLURM_SUBMIT_DIR:-$PWD}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-<unset>}"
+echo "SLURM_GPUS=${SLURM_GPUS:-<unset>}"
+echo "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-<unset>}"
 
-cd "$SLURM_SUBMIT_DIR/complex-iram"
+cd "${SLURM_SUBMIT_DIR:-$PWD}/complex-iram"
 
 # Make Environment Modules available inside non-interactive Slurm jobs.
 if [ -f /etc/profile.d/modules.sh ]; then
@@ -37,27 +46,37 @@ fi
 
 export LD_LIBRARY_PATH="${MAGMA_ROOT}/lib:${CUDA_ROOT}/lib64:${CUDA_ROOT}/targets/x86_64-linux/lib:/opt/ohpc/pub/libs/gnu15/openblas/0.3.30/lib:/opt/ohpc/pub/compiler/gcc/15.2.0/lib64:/usr/lib64:${LD_LIBRARY_PATH:-}"
 
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export RAYON_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-echo "OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS"
-echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
+echo "MAGMA_ROOT=${MAGMA_ROOT}"
+echo "CUDA_ROOT=${CUDA_ROOT}"
+echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+echo "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS}"
+echo "RAYON_NUM_THREADS=${RAYON_NUM_THREADS}"
 
-echo "Checking binary libraries:"
-ldd ./target/release/complex-iram | grep -E "openblas|lapack|not found" || true
+echo "GPU visibility check:"
+which nvidia-smi || true
+
+echo "Runtime dependency check:"
+ldd ./target/release/complex-iram | egrep 'magma|cuda|cublas|cusparse|openblas|gfortran|gomp|not found' || true
+
+if ldd ./target/release/complex-iram| grep -q 'not found'; then
+    echo "ERROR: some shared libraries are still missing; see ldd output above." >&2
+    exit 1
+fi
 
 echo "Running program:"
 JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-REPORT_FILE="cpu_report_non_infl_${JOB_SUFFIX}.txt"
+REPORT_FILE="gpu_report_non_infl_${JOB_SUFFIX}.txt"
 echo "========================================"
     echo "Running with no inflation"
     echo "Output: ${REPORT_FILE}"
     echo "========================================"
 
     ./target/release/complex-iram \
-        --backend lapack \
+        --backend magma \
         --matrix-file matrices/quantum.mtx \
         --nev 8 \
         --ncv 200 \
@@ -69,7 +88,7 @@ echo "========================================"
 
 for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
     JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-    REPORT_FILE="cpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
+    REPORT_FILE="gpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
 
     echo "========================================"
     echo "Running with ritz-inflation=${RITZ_INFLATION}"
@@ -77,15 +96,16 @@ for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
     echo "========================================"
 
     ./target/release/complex-iram \
-        --backend lapack \
+        --backend magma \
         --matrix-file matrices/quantum.mtx \
         --nev 8 \
         --ncv 200 \
         --max-restarts=10000 \
         --tol=1e-16 \
         --ritz-inflation="${RITZ_INFLATION}" \
-        --target smallest-magnitude \
+        --target largest-magnitude \
         --output "${REPORT_FILE}"
 
 done
+
 echo "End date: $(date)"

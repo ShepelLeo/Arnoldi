@@ -36,7 +36,7 @@ pub struct SolverConfig {
     pub max_restarts: usize,
     pub tol: f64,
     pub breakdown_tol: f64,
-    pub ritz_inflation: f64,
+    pub ritz_inflation: Option<f64>,
     pub target: SpectrumTarget,
 }
 
@@ -87,10 +87,12 @@ impl SolverConfig {
             ));
         }
 
-        if !self.ritz_inflation.is_finite() || self.ritz_inflation < 1.0 {
-            return Err(IramError::InvalidConfig(
-                "ritz_inflation must be a finite number >= 1".to_string(),
-            ));
+        if let Some(ritz_inflation) = self.ritz_inflation {
+            if !ritz_inflation.is_finite() || ritz_inflation < 1.0 {
+                return Err(IramError::InvalidConfig(
+                    "ritz_inflation must be a finite number >= 1".to_string(),
+                ));
+            }
         }
 
         Ok(())

@@ -1,11 +1,5 @@
-//! Common implicit shifted QR filter used by all backends.
-//!
-//! The implementation intentionally stays backend-neutral. It operates on the
-//! small Hessenberg matrix on the host, uses a row-major working copy for cache
-//! locality, and returns Fortran-order arrays because the surrounding BLAS/LAPACK
-//! wrappers expect column-major operands.
 
-use ndarray::{Array2, ShapeBuilder, s};
+use ndarray::{Array2, ShapeBuilder};
 use num_complex::Complex64;
 
 unsafe extern "C" {
@@ -18,31 +12,73 @@ unsafe extern "C" {
     );
 }
 
-#[inline]
+#[inline(always)]
 fn zero() -> Complex64 {
     Complex64::ZERO
 }
 
-fn to_fortran_vec(a: &Array2<Complex64>) -> Vec<Complex64> {
-    let (rows, cols) = a.dim();
-    let mut out = Vec::with_capacity(rows * cols);
+#[inline(always)]
+fn one() -> Complex64 {
+    Complex64::new(1.0, 0.0)
+}
 
-    for j in 0..cols {
-        for i in 0..rows {
-            out.push(a[(i, j)]);
-        }
+#[inline(always)]
+fn idx(n: usize, row: usize, column: usize) -> usize {
+    row * n + column
+}
+
+/// Reusable storage for the shifted QR filter.
+///
+/// The one-shot `shifted_qr_filter` creates this internally. If restart code is
+/// later changed to keep a backend/workspace object alive, use
+/// `shifted_qr_filter_with_workspace` to avoid reallocating these buffers on
+/// every restart.
+#[derive(Debug, Clone, Default)]
+pub struct ShiftedQrWorkspace {
+    n: usize,
+    h_row_major: Vec<Complex64>,
+    q_row_major: Vec<Complex64>,
+    h_fortran: Vec<Complex64>,
+    q_fortran: Vec<Complex64>,
+}
+
+impl ShiftedQrWorkspace {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    out
+    pub fn with_dimension(n: usize) -> Self {
+        let mut workspace = Self::new();
+        workspace.resize(n);
+        workspace
+    }
+
+    fn resize(&mut self, n: usize) {
+        self.n = n;
+        let len = n.saturating_mul(n);
+        self.h_row_major.resize(len, zero());
+        self.q_row_major.resize(len, zero());
+        self.h_fortran.resize(len, zero());
+        self.q_fortran.resize(len, zero());
+    }
 }
 
-fn from_fortran_vec(rows: usize, cols: usize, data: Vec<Complex64>) -> Array2<Complex64> {
-    Array2::from_shape_vec((rows, cols).f(), data).expect("invalid Fortran buffer shape")
-}
-
+/// Backward-compatible one-shot API.
 pub fn shifted_qr_filter(
     hessenberg: &Array2<Complex64>,
     shifts: &[Complex64],
+) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
+    let mut workspace = ShiftedQrWorkspace::new();
+    shifted_qr_filter_with_workspace(hessenberg, shifts, &mut workspace)
+}
+
+/// Workspace-aware shifted QR API.
+///
+/// Returns `(Q, H_filtered)` in Fortran/column-major ndarray layout.
+pub fn shifted_qr_filter_with_workspace(
+    hessenberg: &Array2<Complex64>,
+    shifts: &[Complex64],
+    workspace: &mut ShiftedQrWorkspace,
 ) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
     let (h_rows, h_cols) = hessenberg.dim();
 
@@ -51,60 +87,100 @@ pub fn shifted_qr_filter(
     }
 
     let n = h_rows;
+    workspace.resize(n);
 
-    // Work in row-major layout; the longest sweeps are along rows.
-    let mut h = hessenberg.to_owned();
-    let mut rotation = complex_identity(n);
+    copy_ndarray_to_row_major(hessenberg, &mut workspace.h_row_major, n);
+    fill_identity_row_major(&mut workspace.q_row_major, n);
 
-    if shifts.is_empty() {
-        let rotation_f = from_fortran_vec(n, n, to_fortran_vec(&rotation));
-        let h_f = from_fortran_vec(n, n, to_fortran_vec(&h));
-        return Ok((rotation_f, h_f));
+    if n == 0 {
+        return Ok((
+            Array2::zeros((0, 0).f()),
+            Array2::zeros((0, 0).f()),
+        ));
     }
 
-    let safe_threshold = safe_minimum_threshold(n);
+    if !shifts.is_empty() {
+        let safe_threshold = safe_minimum_threshold(n);
+        let h_norm = hessenberg_one_norm_row_major(&workspace.h_row_major, n)
+            .max(safe_threshold);
 
-    for (shift_index, shift) in shifts.iter().copied().enumerate() {
-        apply_implicit_shift(
-            &mut h,
-            &mut rotation,
-            shift,
-            shift_index,
-            safe_threshold,
+        for (shift_index, shift) in shifts.iter().copied().enumerate() {
+            apply_implicit_shift_row_major(
+                &mut workspace.h_row_major,
+                &mut workspace.q_row_major,
+                n,
+                shift,
+                shift_index,
+                safe_threshold,
+                h_norm,
+            );
+        }
+
+        make_subdiagonal_real_nonnegative_row_major(
+            &mut workspace.h_row_major,
+            &mut workspace.q_row_major,
+            n,
         );
-
-        cleanup_hessenberg_roundoff(&mut h);
+        deflate_small_subdiagonals_row_major(
+            &mut workspace.h_row_major,
+            n,
+            safe_threshold,
+            h_norm,
+        );
     }
 
-    make_subdiagonal_real_nonnegative(&mut h, &mut rotation);
-    deflate_small_subdiagonals(&mut h, safe_threshold);
-    cleanup_hessenberg_roundoff(&mut h);
+    cleanup_hessenberg_roundoff_row_major(&mut workspace.h_row_major, n);
 
-    let rotation_f = from_fortran_vec(n, n, to_fortran_vec(&rotation));
-    let h_f = from_fortran_vec(n, n, to_fortran_vec(&h));
+    copy_row_major_to_fortran(&workspace.q_row_major, &mut workspace.q_fortran, n);
+    copy_row_major_to_fortran(&workspace.h_row_major, &mut workspace.h_fortran, n);
 
-    Ok((rotation_f, h_f))
+    let q = Array2::from_shape_vec((n, n).f(), workspace.q_fortran.clone())
+        .expect("invalid Fortran rotation buffer shape");
+    let h = Array2::from_shape_vec((n, n).f(), workspace.h_fortran.clone())
+        .expect("invalid Fortran Hessenberg buffer shape");
+
+    Ok((q, h))
 }
 
-fn complex_identity(n: usize) -> Array2<Complex64> {
-    let mut eye = Array2::<Complex64>::zeros((n, n));
+fn copy_ndarray_to_row_major(matrix: &Array2<Complex64>, output: &mut [Complex64], n: usize) {
+    debug_assert_eq!(output.len(), n * n);
+
+    for row in 0..n {
+        for column in 0..n {
+            output[idx(n, row, column)] = matrix[(row, column)];
+        }
+    }
+}
+
+fn copy_row_major_to_fortran(input: &[Complex64], output: &mut [Complex64], n: usize) {
+    debug_assert_eq!(input.len(), n * n);
+    debug_assert_eq!(output.len(), n * n);
+
+    for column in 0..n {
+        for row in 0..n {
+            output[row + column * n] = input[idx(n, row, column)];
+        }
+    }
+}
+
+fn fill_identity_row_major(matrix: &mut [Complex64], n: usize) {
+    debug_assert_eq!(matrix.len(), n * n);
+    matrix.fill(zero());
 
     for i in 0..n {
-        eye[[i, i]] = Complex64::new(1.0, 0.0);
+        matrix[idx(n, i, i)] = one();
     }
-
-    eye
 }
 
-fn apply_implicit_shift(
-    h: &mut Array2<Complex64>,
-    rotation: &mut Array2<Complex64>,
+fn apply_implicit_shift_row_major(
+    h: &mut [Complex64],
+    rotation: &mut [Complex64],
+    n: usize,
     shift: Complex64,
     shift_index: usize,
     safe_threshold: f64,
+    h_norm: f64,
 ) {
-    let n = h.nrows();
-
     if n < 2 {
         return;
     }
@@ -115,8 +191,8 @@ fn apply_implicit_shift(
         let mut iend = n - 1;
 
         for i in istart..n - 1 {
-            if should_deflate_fast(h, i, safe_threshold) {
-                h[[i + 1, i]] = Complex64::ZERO;
+            if should_deflate_fast_row_major(h, n, i, safe_threshold, h_norm) {
+                h[idx(n, i + 1, i)] = zero();
                 iend = i;
                 break;
             }
@@ -127,24 +203,30 @@ fn apply_implicit_shift(
             continue;
         }
 
-        let mut f = h[[istart, istart]] - shift;
-        let mut g = h[[istart + 1, istart]];
+        let mut f = h[idx(n, istart, istart)] - shift;
+        let mut g = h[idx(n, istart + 1, istart)];
 
         for i in istart..iend {
             let (c, s, r) = zlartg(f, g);
 
             if i > istart {
-                h[[i, i - 1]] = r;
-                h[[i + 1, i - 1]] = Complex64::ZERO;
+                h[idx(n, i, i - 1)] = r;
+                h[idx(n, i + 1, i - 1)] = zero();
             }
 
-            apply_givens_from_left(h, i, c, s);
-            apply_givens_from_right(h, i, iend, c, s);
-            accumulate_givens(rotation, i, shift_index, c, s);
+            apply_givens_from_left_row_major(h, n, i, c, s);
+            apply_givens_from_right_row_major(h, n, i, iend, c, s);
+            accumulate_givens_row_major(rotation, n, i, shift_index, c, s);
+
+            // Keep the chased bulge explicitly clean. This replaces the old
+            // full O(n^2) cleanup after every shift.
+            if i > 0 && i + 1 < n {
+                h[idx(n, i + 1, i - 1)] = zero();
+            }
 
             if i + 1 < iend {
-                f = h[[i + 1, i]];
-                g = h[[i + 2, i]];
+                f = h[idx(n, i + 1, i)];
+                g = h[idx(n, i + 2, i)];
             }
         }
 
@@ -155,8 +237,8 @@ fn apply_implicit_shift(
 #[inline(always)]
 fn zlartg(f: Complex64, g: Complex64) -> (f64, Complex64, Complex64) {
     let mut c = 0.0;
-    let mut s = Complex64::ZERO;
-    let mut r = Complex64::ZERO;
+    let mut s = zero();
+    let mut r = zero();
 
     unsafe {
         zlartg_(&f, &g, &mut c, &mut s, &mut r);
@@ -166,8 +248,9 @@ fn zlartg(f: Complex64, g: Complex64) -> (f64, Complex64, Complex64) {
 }
 
 #[inline(always)]
-fn apply_givens_from_left(
-    h: &mut Array2<Complex64>,
+fn apply_givens_from_left_row_major(
+    h: &mut [Complex64],
+    n: usize,
     i: usize,
     c: f64,
     s: Complex64,
@@ -175,21 +258,22 @@ fn apply_givens_from_left(
     let c = Complex64::new(c, 0.0);
     let s_conj = s.conj();
 
-    let (mut upper_row, mut lower_row) =
-        h.multi_slice_mut((s![i, i..], s![i + 1, i..]));
+    for column in i..n {
+        let upper_index = idx(n, i, column);
+        let lower_index = idx(n, i + 1, column);
 
-    for (upper_ref, lower_ref) in upper_row.iter_mut().zip(lower_row.iter_mut()) {
-        let upper = *upper_ref;
-        let lower = *lower_ref;
+        let upper = h[upper_index];
+        let lower = h[lower_index];
 
-        *upper_ref = c * upper + s * lower;
-        *lower_ref = -s_conj * upper + c * lower;
+        h[upper_index] = c * upper + s * lower;
+        h[lower_index] = -s_conj * upper + c * lower;
     }
 }
 
 #[inline(always)]
-fn apply_givens_from_right(
-    h: &mut Array2<Complex64>,
+fn apply_givens_from_right_row_major(
+    h: &mut [Complex64],
+    n: usize,
     i: usize,
     iend: usize,
     c: f64,
@@ -197,24 +281,24 @@ fn apply_givens_from_right(
 ) {
     let c = Complex64::new(c, 0.0);
     let s_conj = s.conj();
-
     let last_row = usize::min(i + 2, iend);
 
-    let (mut left_col, mut right_col) =
-        h.multi_slice_mut((s![..=last_row, i], s![..=last_row, i + 1]));
+    for row in 0..=last_row {
+        let left_index = idx(n, row, i);
+        let right_index = idx(n, row, i + 1);
 
-    for (left_ref, right_ref) in left_col.iter_mut().zip(right_col.iter_mut()) {
-        let left = *left_ref;
-        let right = *right_ref;
+        let left = h[left_index];
+        let right = h[right_index];
 
-        *left_ref = c * left + s_conj * right;
-        *right_ref = -s * left + c * right;
+        h[left_index] = c * left + s_conj * right;
+        h[right_index] = -s * left + c * right;
     }
 }
 
 #[inline(always)]
-fn accumulate_givens(
-    rotation: &mut Array2<Complex64>,
+fn accumulate_givens_row_major(
+    rotation: &mut [Complex64],
+    n: usize,
     i: usize,
     shift_index: usize,
     c: f64,
@@ -223,30 +307,30 @@ fn accumulate_givens(
     let c = Complex64::new(c, 0.0);
     let s_conj = s.conj();
 
-    // Fast banded accumulation. It is enough for the restart filter and avoids
-    // touching the full dense rotation matrix in early shifts.
-    let row_count = usize::min(i + shift_index + 2, rotation.nrows());
+    // Same band-limited accumulation strategy as the previous implementation.
+    // It avoids touching the whole dense rotation matrix during early shifts.
+    let row_count = usize::min(i + shift_index + 2, n);
 
-    let (mut left_col, mut right_col) =
-        rotation.multi_slice_mut((s![..row_count, i], s![..row_count, i + 1]));
+    for row in 0..row_count {
+        let left_index = idx(n, row, i);
+        let right_index = idx(n, row, i + 1);
 
-    for (left_ref, right_ref) in left_col.iter_mut().zip(right_col.iter_mut()) {
-        let left = *left_ref;
-        let right = *right_ref;
+        let left = rotation[left_index];
+        let right = rotation[right_index];
 
-        *left_ref = c * left + s_conj * right;
-        *right_ref = -s * left + c * right;
+        rotation[left_index] = c * left + s_conj * right;
+        rotation[right_index] = -s * left + c * right;
     }
 }
 
-fn make_subdiagonal_real_nonnegative(
-    h: &mut Array2<Complex64>,
-    rotation: &mut Array2<Complex64>,
+fn make_subdiagonal_real_nonnegative_row_major(
+    h: &mut [Complex64],
+    rotation: &mut [Complex64],
+    n: usize,
 ) {
-    let n = h.nrows();
-
     for j in 0..n.saturating_sub(1) {
-        let subdiagonal = h[[j + 1, j]];
+        let subdiagonal_index = idx(n, j + 1, j);
+        let subdiagonal = h[subdiagonal_index];
         let magnitude = subdiagonal.norm();
 
         if magnitude == 0.0 || (subdiagonal.im == 0.0 && subdiagonal.re >= 0.0) {
@@ -256,57 +340,58 @@ fn make_subdiagonal_real_nonnegative(
         let phase = subdiagonal / magnitude;
         let phase_conj = phase.conj();
 
-        {
-            let mut row = h.slice_mut(s![j + 1, j..]);
-
-            for value in row.iter_mut() {
-                *value *= phase_conj;
-            }
+        // Left phase scaling: row j + 1, columns j..n.
+        for column in j..n {
+            h[idx(n, j + 1, column)] *= phase_conj;
         }
 
-        {
-            let last_row = usize::min(j + 2, n - 1);
-            let mut col = h.slice_mut(s![..=last_row, j + 1]);
-
-            for value in col.iter_mut() {
-                *value *= phase;
-            }
+        // Right phase scaling: column j + 1, only rows that can be nonzero in
+        // Hessenberg structure.
+        let last_row = usize::min(j + 2, n - 1);
+        for row in 0..=last_row {
+            h[idx(n, row, j + 1)] *= phase;
         }
 
-        {
-            let mut rot_col = rotation.slice_mut(s![.., j + 1]);
-
-            for value in rot_col.iter_mut() {
-                *value *= phase;
-            }
+        // Keep accumulated Q consistent with the right phase scaling.
+        for row in 0..n {
+            rotation[idx(n, row, j + 1)] *= phase;
         }
 
-        h[[j + 1, j]] = Complex64::new(magnitude, 0.0);
+        h[subdiagonal_index] = Complex64::new(magnitude, 0.0);
     }
 }
 
-fn deflate_small_subdiagonals(h: &mut Array2<Complex64>, safe_threshold: f64) {
-    let n = h.nrows();
-
+fn deflate_small_subdiagonals_row_major(
+    h: &mut [Complex64],
+    n: usize,
+    safe_threshold: f64,
+    h_norm: f64,
+) {
     for i in 0..n.saturating_sub(1) {
-        if should_deflate_fast(h, i, safe_threshold) {
-            h[[i + 1, i]] = Complex64::ZERO;
+        if should_deflate_fast_row_major(h, n, i, safe_threshold, h_norm) {
+            h[idx(n, i + 1, i)] = zero();
         }
     }
 }
 
 #[inline(always)]
-fn should_deflate_fast(h: &Array2<Complex64>, i: usize, safe_threshold: f64) -> bool {
-    let subdiagonal_norm = h[[i + 1, i]].norm();
+fn should_deflate_fast_row_major(
+    h: &[Complex64],
+    n: usize,
+    i: usize,
+    safe_threshold: f64,
+    h_norm: f64,
+) -> bool {
+    let subdiagonal_norm = h[idx(n, i + 1, i)].norm();
 
     if subdiagonal_norm == 0.0 {
         return true;
     }
 
-    let mut scale = h[[i, i]].norm() + h[[i + 1, i + 1]].norm();
+    let mut scale = h[idx(n, i, i)].norm() + h[idx(n, i + 1, i + 1)].norm();
 
     if scale == 0.0 {
-        scale = hessenberg_one_norm(h);
+        scale = h_norm;
     }
 
     subdiagonal_norm <= (f64::EPSILON * scale).max(safe_threshold)
@@ -316,19 +401,73 @@ fn safe_minimum_threshold(n: usize) -> f64 {
     f64::MIN_POSITIVE * (n.max(1) as f64 / f64::EPSILON)
 }
 
-fn hessenberg_one_norm(h: &Array2<Complex64>) -> f64 {
-    (0..h.ncols())
-        .map(|column| {
-            let last_row = usize::min(column + 1, h.nrows().saturating_sub(1));
-            (0..=last_row).map(|row| h[[row, column]].norm()).sum()
-        })
-        .fold(0.0, f64::max)
+fn hessenberg_one_norm_row_major(h: &[Complex64], n: usize) -> f64 {
+    let mut norm = 0.0;
+
+    for column in 0..n {
+        let last_row = usize::min(column + 1, n.saturating_sub(1));
+        let mut column_sum = 0.0;
+
+        for row in 0..=last_row {
+            column_sum += h[idx(n, row, column)].norm();
+        }
+
+        if column_sum > norm {
+            norm = column_sum;
+        }
+    }
+
+    norm
 }
 
-fn cleanup_hessenberg_roundoff(h: &mut Array2<Complex64>) {
-    for row in 0..h.nrows() {
-        for column in 0..row.saturating_sub(1) {
-            h[[row, column]] = Complex64::ZERO;
+fn cleanup_hessenberg_roundoff_row_major(h: &mut [Complex64], n: usize) {
+    for row in 2..n {
+        for column in 0..row - 1 {
+            h[idx(n, row, column)] = zero();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::arr2;
+
+    fn conjugate_transpose(matrix: &Array2<Complex64>) -> Array2<Complex64> {
+        matrix.t().map(|value| value.conj()).to_owned()
+    }
+
+    fn max_abs_diff(left: &Array2<Complex64>, right: &Array2<Complex64>) -> f64 {
+        left.iter()
+            .zip(right.iter())
+            .map(|(l, r)| (*l - *r).norm())
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn shifted_qr_filter_preserves_similarity_for_small_hessenberg() {
+        let h = arr2(&[
+            [
+                Complex64::new(2.0, 0.1),
+                Complex64::new(1.0, -0.3),
+                Complex64::new(0.2, 0.4),
+            ],
+            [
+                Complex64::new(0.7, 0.0),
+                Complex64::new(1.0, -0.2),
+                Complex64::new(-0.5, 0.1),
+            ],
+            [
+                Complex64::ZERO,
+                Complex64::new(0.4, 0.0),
+                Complex64::new(-1.0, 0.5),
+            ],
+        ]);
+        let shifts = [Complex64::new(0.25, -0.4), Complex64::new(-0.1, 0.2)];
+
+        let (q, filtered_h) = shifted_qr_filter(&h, &shifts).unwrap();
+        let reconstructed = q.dot(&filtered_h).dot(&conjugate_transpose(&q));
+
+        assert!(max_abs_diff(&h, &reconstructed) <= 1.0e-8);
     }
 }

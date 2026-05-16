@@ -17,7 +17,7 @@ pub fn select_ritz_values(
     target: SpectrumTarget,
     nev: usize,
     max_keep: usize,
-    inflation: f64,
+    inflation: Option<f64>,
 ) -> Result<SelectionOut, IramError> {
     if values.is_empty() {
         return Ok(SelectionOut {
@@ -39,12 +39,34 @@ pub fn select_ritz_values(
     let mut wanted = base_selection(values, target, retained_dimension, &order);
     wanted.sort_unstable();
 
-    let shifts = topology_cluster(values, &wanted, target, inflation);
-
+    let shifts = match inflation {
+        Some(inflation) => topology_cluster(values, &wanted, target, inflation),
+        None => all_unwanted_values(values, &wanted),
+    };
     Ok(SelectionOut {
         wanted,
         shifts,
     })
+}
+
+fn all_unwanted_values(values: &[Complex64], wanted: &[usize]) -> Vec<Complex64> {
+    let mut is_wanted = vec![false; values.len()];
+
+    for &index in wanted {
+        is_wanted[index] = true;
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &value)| {
+            if is_wanted[index] {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .collect()
 }
 
 fn base_selection(
@@ -162,7 +184,7 @@ fn topology_cluster(
             let radius = wanted
                 .iter()
                 .map(|&i| (values[i].re - center).abs())
-                .fold(0.0_f64, f64::min);
+                .fold(f64::INFINITY, f64::min);
 
             // 7. Shifts = числа вне окружности
             let shifts: Vec<Complex64> = values

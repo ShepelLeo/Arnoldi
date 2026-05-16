@@ -37,7 +37,7 @@ pub enum SchurError {
     InvalidEigenIndex(usize),
 }
 
-type MagmaQueue = *mut c_void;
+//type MagmaQueue = *mut c_void;
 
 const MAGMA_NO_TRANS: c_int = 111;
 const MAGMA_CONJ_TRANS: c_int = 113;
@@ -49,120 +49,274 @@ const MAGMA_FILE: *const c_char = b"src/linalg/magma.rs\0".as_ptr().cast();
 
 static MAGMA_INIT: Once = Once::new();
 
+// MAGMA normally uses C int for magma_int_t unless built with ILP64.
+type MagmaInt = c_int;
+type MagmaDevice = c_int;
+
+// Opaque MAGMA queue handle.
+#[repr(C)]
+pub struct MagmaQueueOpaque {
+    _private: [u8; 0],
+}
+
+type MagmaQueue = *mut MagmaQueueOpaque;
+
 unsafe extern "C" {
-    fn magma_init() -> c_int;
-    fn magma_getdevice(device: *mut c_int);
+    fn magma_init() -> MagmaInt;
+    fn magma_finalize() -> MagmaInt;
+
+    fn magma_getdevice(device: *mut MagmaDevice);
+
+    // magma_queue_create(...) is a C macro, so bind the real exported function.
     fn magma_queue_create_internal(
-        device: c_int,
+        device: MagmaDevice,
         queue_ptr: *mut MagmaQueue,
         func: *const c_char,
         file: *const c_char,
         line: c_int,
     );
+
+    // magma_queue_destroy(...) is also a macro.
     fn magma_queue_destroy_internal(
         queue: MagmaQueue,
         func: *const c_char,
         file: *const c_char,
         line: c_int,
     );
-    fn magma_malloc(ptr_ptr: *mut *mut c_void, bytes: usize) -> c_int;
+
+    fn magma_malloc(ptr_ptr: *mut *mut c_void, bytes: usize) -> MagmaInt;
+
+    // magma_free(...) is a macro.
     fn magma_free_internal(
         ptr: *mut c_void,
         func: *const c_char,
         file: *const c_char,
         line: c_int,
-    ) -> c_int;
-    fn magma_zsetmatrix(
-        m: c_int,
-        n: c_int,
-        h_a: *const Complex64,
-        lda: c_int,
-        d_a: *mut Complex64,
-        ldda: c_int,
+    ) -> MagmaInt;
+
+    // magma_zsetmatrix(...) / magma_zgetmatrix(...) are macros/static inline wrappers.
+    // Bind the generic exported internal functions instead.
+    fn magma_setmatrix_internal(
+        m: MagmaInt,
+        n: MagmaInt,
+        elem_size: MagmaInt,
+        h_a: *const c_void,
+        lda: MagmaInt,
+        d_a: *mut c_void,
+        ldda: MagmaInt,
         queue: MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
     );
-    fn magma_zgetmatrix(
-        m: c_int,
-        n: c_int,
-        d_a: *const Complex64,
-        ldda: c_int,
-        h_a: *mut Complex64,
-        lda: c_int,
+
+    fn magma_getmatrix_internal(
+        m: MagmaInt,
+        n: MagmaInt,
+        elem_size: MagmaInt,
+        d_a: *const c_void,
+        ldda: MagmaInt,
+        h_a: *mut c_void,
+        lda: MagmaInt,
         queue: MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
     );
-    fn magma_zsetvector(
-        n: c_int,
-        h_x: *const Complex64,
-        incx: c_int,
-        d_x: *mut Complex64,
-        incx_dev: c_int,
+
+    fn magma_setvector_internal(
+        n: MagmaInt,
+        elem_size: MagmaInt,
+        h_x: *const c_void,
+        incx: MagmaInt,
+        d_x: *mut c_void,
+        incx_dev: MagmaInt,
         queue: MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
     );
-    fn magma_zgetvector(
-        n: c_int,
-        d_x: *const Complex64,
-        incx_dev: c_int,
-        h_x: *mut Complex64,
-        incx: c_int,
+
+    fn magma_getvector_internal(
+        n: MagmaInt,
+        elem_size: MagmaInt,
+        d_x: *const c_void,
+        incx_dev: MagmaInt,
+        h_x: *mut c_void,
+        incx: MagmaInt,
         queue: MagmaQueue,
+        func: *const c_char,
+        file: *const c_char,
+        line: c_int,
     );
+
     fn magma_zgemm(
-        transa: c_int,
-        transb: c_int,
-        m: c_int,
-        n: c_int,
-        k: c_int,
+        transa: MagmaInt,
+        transb: MagmaInt,
+        m: MagmaInt,
+        n: MagmaInt,
+        k: MagmaInt,
         alpha: Complex64,
         d_a: *const Complex64,
-        ldda: c_int,
+        ldda: MagmaInt,
         d_b: *const Complex64,
-        lddb: c_int,
+        lddb: MagmaInt,
         beta: Complex64,
         d_c: *mut Complex64,
-        lddc: c_int,
+        lddc: MagmaInt,
         queue: MagmaQueue,
     );
+
     fn magma_zgemv(
-        trans: c_int,
-        m: c_int,
-        n: c_int,
+        trans: MagmaInt,
+        m: MagmaInt,
+        n: MagmaInt,
         alpha: Complex64,
         d_a: *const Complex64,
-        ldda: c_int,
+        ldda: MagmaInt,
         d_x: *const Complex64,
-        incx: c_int,
+        incx: MagmaInt,
         beta: Complex64,
         d_y: *mut Complex64,
-        incy: c_int,
+        incy: MagmaInt,
         queue: MagmaQueue,
     );
+
     fn magma_zgeev(
-        jobvl: c_int,
-        jobvr: c_int,
-        n: c_int,
+        jobvl: MagmaInt,
+        jobvr: MagmaInt,
+        n: MagmaInt,
         a: *mut Complex64,
-        lda: c_int,
+        lda: MagmaInt,
         w: *mut Complex64,
         vl: *mut Complex64,
-        ldvl: c_int,
+        ldvl: MagmaInt,
         vr: *mut Complex64,
-        ldvr: c_int,
+        ldvr: MagmaInt,
         work: *mut Complex64,
-        lwork: c_int,
+        lwork: MagmaInt,
         rwork: *mut f64,
-        info: *mut c_int,
-    ) -> c_int;
+        info: *mut MagmaInt,
+    ) -> MagmaInt;
+
     fn magma_zgeqrf(
-        m: c_int,
-        n: c_int,
+        m: MagmaInt,
+        n: MagmaInt,
         a: *mut Complex64,
-        lda: c_int,
+        lda: MagmaInt,
         tau: *mut Complex64,
         work: *mut Complex64,
-        lwork: c_int,
-        info: *mut c_int,
-    ) -> c_int;
+        lwork: MagmaInt,
+        info: *mut MagmaInt,
+    ) -> MagmaInt;
 }
+
+const MAGMA_COMPLEX64_SIZE: MagmaInt = std::mem::size_of::<Complex64>() as MagmaInt;
+
+#[inline]
+unsafe fn magma_zsetmatrix(
+    m: MagmaInt,
+    n: MagmaInt,
+    h_a: *const Complex64,
+    lda: MagmaInt,
+    d_a: *mut Complex64,
+    ldda: MagmaInt,
+    queue: MagmaQueue,
+) {
+    unsafe {
+        magma_setmatrix_internal(
+            m,
+            n,
+            MAGMA_COMPLEX64_SIZE,
+            h_a.cast::<c_void>(),
+            lda,
+            d_a.cast::<c_void>(),
+            ldda,
+            queue,
+            MAGMA_FUNC,
+            MAGMA_FILE,
+            line!() as c_int,
+        );
+    }
+}
+
+#[inline]
+unsafe fn magma_zgetmatrix(
+    m: MagmaInt,
+    n: MagmaInt,
+    d_a: *const Complex64,
+    ldda: MagmaInt,
+    h_a: *mut Complex64,
+    lda: MagmaInt,
+    queue: MagmaQueue,
+) {
+    unsafe {
+        magma_getmatrix_internal(
+            m,
+            n,
+            MAGMA_COMPLEX64_SIZE,
+            d_a.cast::<c_void>(),
+            ldda,
+            h_a.cast::<c_void>(),
+            lda,
+            queue,
+            MAGMA_FUNC,
+            MAGMA_FILE,
+            line!() as c_int,
+        );
+    }
+}
+
+#[inline]
+unsafe fn magma_zsetvector(
+    n: MagmaInt,
+    h_x: *const Complex64,
+    incx: MagmaInt,
+    d_x: *mut Complex64,
+    incx_dev: MagmaInt,
+    queue: MagmaQueue,
+) {
+    unsafe {
+        magma_setvector_internal(
+            n,
+            MAGMA_COMPLEX64_SIZE,
+            h_x.cast::<c_void>(),
+            incx,
+            d_x.cast::<c_void>(),
+            incx_dev,
+            queue,
+            MAGMA_FUNC,
+            MAGMA_FILE,
+            line!() as c_int,
+        );
+    }
+}
+
+#[inline]
+unsafe fn magma_zgetvector(
+    n: MagmaInt,
+    d_x: *const Complex64,
+    incx_dev: MagmaInt,
+    h_x: *mut Complex64,
+    incx: MagmaInt,
+    queue: MagmaQueue,
+) {
+    unsafe {
+        magma_getvector_internal(
+            n,
+            MAGMA_COMPLEX64_SIZE,
+            d_x.cast::<c_void>(),
+            incx_dev,
+            h_x.cast::<c_void>(),
+            incx,
+            queue,
+            MAGMA_FUNC,
+            MAGMA_FILE,
+            line!() as c_int,
+        );
+    }
+}
+
 
 struct Queue {
     raw: MagmaQueue,
@@ -278,11 +432,320 @@ fn magma_trans(trans: ZgemmTranspose) -> c_int {
     }
 }
 
+fn magma_trans_from_zgemv(trans: ZgemvTranspose) -> c_int {
+    match trans {
+        ZgemvTranspose::None => MAGMA_NO_TRANS,
+        ZgemvTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
+    }
+}
+
 fn transposed_shape(rows: usize, columns: usize, trans: ZgemmTranspose) -> (usize, usize) {
     match trans {
         ZgemmTranspose::None => (rows, columns),
         ZgemmTranspose::ConjugateTranspose => (columns, rows),
     }
+}
+
+/// Reusable MAGMA/CUDA execution context.
+///
+/// Keep one session across several BLAS calls to avoid recreating a MAGMA queue
+/// for every small operation.
+pub struct MagmaSession {
+    queue: Queue,
+}
+
+impl MagmaSession {
+    pub fn new() -> Self {
+        Self { queue: Queue::new() }
+    }
+}
+
+impl Default for MagmaSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Device-side vector buffer owned by Rust and allocated by MAGMA.
+pub struct DeviceVector {
+    buffer: DeviceBuffer,
+    len: usize,
+}
+
+impl DeviceVector {
+    pub fn new(len: usize) -> Self {
+        Self {
+            buffer: DeviceBuffer::new(len),
+            len,
+        }
+    }
+
+    pub fn from_slice(session: &MagmaSession, values: &[Complex64]) -> Self {
+        let mut vector = Self::new(values.len());
+        vector.copy_from_slice(session, values);
+        vector
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn copy_from_slice(&mut self, session: &MagmaSession, values: &[Complex64]) {
+        assert_eq!(self.len, values.len());
+        if self.len == 0 {
+            return;
+        }
+        unsafe {
+            magma_zsetvector(
+                self.len as c_int,
+                values.as_ptr(),
+                1,
+                self.buffer.ptr,
+                1,
+                session.queue.raw,
+            );
+        }
+    }
+
+    pub fn copy_to_slice(&self, session: &MagmaSession, values: &mut [Complex64]) {
+        assert_eq!(self.len, values.len());
+        if self.len == 0 {
+            return;
+        }
+        unsafe {
+            magma_zgetvector(
+                self.len as c_int,
+                self.buffer.ptr,
+                1,
+                values.as_mut_ptr(),
+                1,
+                session.queue.raw,
+            );
+        }
+    }
+
+    #[inline]
+    fn ptr(&self) -> *const Complex64 {
+        self.buffer.ptr
+    }
+
+    #[inline]
+    fn mut_ptr(&mut self) -> *mut Complex64 {
+        self.buffer.ptr
+    }
+}
+
+/// Device-side column-major dense matrix owned by Rust and allocated by MAGMA.
+pub struct DeviceMatrix {
+    buffer: DeviceBuffer,
+    rows: usize,
+    columns: usize,
+    lda: c_int,
+}
+
+impl DeviceMatrix {
+    pub fn new(rows: usize, columns: usize) -> Self {
+        Self {
+            buffer: DeviceBuffer::new(rows.saturating_mul(columns)),
+            rows,
+            columns,
+            lda: rows.max(1) as c_int,
+        }
+    }
+
+    pub fn from_column_major(session: &MagmaSession, matrix: ArrayView2<'_, Complex64>) -> Self {
+        let (rows, columns) = matrix.dim();
+        assert_column_major_contiguous(matrix, "DeviceMatrix::from_column_major");
+        let memory = matrix
+            .as_slice_memory_order()
+            .expect("column-major matrix must be contiguous");
+        let mut device = Self::new(rows, columns);
+        if rows != 0 && columns != 0 {
+            unsafe {
+                magma_zsetmatrix(
+                    rows as c_int,
+                    columns as c_int,
+                    memory.as_ptr(),
+                    rows.max(1) as c_int,
+                    device.buffer.ptr,
+                    device.lda,
+                    session.queue.raw,
+                );
+            }
+        }
+        device
+    }
+
+    pub fn copy_to_column_major(
+        &self,
+        session: &MagmaSession,
+        output: &mut [Complex64],
+    ) {
+        assert_eq!(output.len(), self.rows * self.columns);
+        if self.rows == 0 || self.columns == 0 {
+            return;
+        }
+        unsafe {
+            magma_zgetmatrix(
+                self.rows as c_int,
+                self.columns as c_int,
+                self.buffer.ptr,
+                self.lda,
+                output.as_mut_ptr(),
+                self.rows.max(1) as c_int,
+                session.queue.raw,
+            );
+        }
+    }
+
+    pub fn zgemv(
+        &self,
+        session: &MagmaSession,
+        trans: ZgemvTranspose,
+        alpha: Complex64,
+        x: &DeviceVector,
+        beta: Complex64,
+        y: &mut DeviceVector,
+    ) {
+        let (x_len, y_len) = match trans {
+            ZgemvTranspose::None => (self.columns, self.rows),
+            ZgemvTranspose::ConjugateTranspose => (self.rows, self.columns),
+        };
+        assert_eq!(x.len(), x_len);
+        assert_eq!(y.len(), y_len);
+
+        if y_len == 0 {
+            return;
+        }
+        if x_len == 0 {
+            panic!("device zgemv with empty x is not supported here");
+        }
+
+        unsafe {
+            magma_zgemv(
+                magma_trans_from_zgemv(trans),
+                self.rows as c_int,
+                self.columns as c_int,
+                alpha,
+                self.buffer.ptr,
+                self.lda,
+                x.ptr(),
+                1,
+                beta,
+                y.mut_ptr(),
+                1,
+                session.queue.raw,
+            );
+        }
+    }
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// Uploads one host vector into a column of this device matrix.
+    ///
+    /// The matrix is stored in column-major layout with leading dimension `lda`.
+    /// This is the key primitive that lets Arnoldi keep the basis resident on
+    /// the GPU and append one new vector per step instead of re-uploading the
+    /// whole basis matrix for every orthogonalization call.
+    pub fn copy_column_from_slice(
+        &mut self,
+        session: &MagmaSession,
+        column: usize,
+        values: &[Complex64],
+    ) {
+        assert!(column < self.columns);
+        assert_eq!(values.len(), self.rows);
+        if self.rows == 0 {
+            return;
+        }
+
+        unsafe {
+            let destination = self.buffer.ptr.add(column * self.lda as usize);
+            magma_zsetvector(
+                self.rows as c_int,
+                values.as_ptr(),
+                1,
+                destination,
+                1,
+                session.queue.raw,
+            );
+        }
+    }
+
+    /// Computes GEMV using only the leading `columns` columns of this device matrix.
+    ///
+    /// This avoids materializing a new device matrix view for `V[:, 0..j]` during
+    /// Arnoldi. MAGMA sees the same base pointer and leading dimension, but the
+    /// logical matrix width is restricted to `columns`.
+    pub fn zgemv_leading_columns(
+        &self,
+        session: &MagmaSession,
+        columns: usize,
+        trans: ZgemvTranspose,
+        alpha: Complex64,
+        x: &DeviceVector,
+        beta: Complex64,
+        y: &mut DeviceVector,
+    ) {
+        assert!(columns <= self.columns);
+        let (x_len, y_len) = match trans {
+            ZgemvTranspose::None => (columns, self.rows),
+            ZgemvTranspose::ConjugateTranspose => (self.rows, columns),
+        };
+        assert_eq!(x.len(), x_len);
+        assert_eq!(y.len(), y_len);
+
+        if y_len == 0 {
+            return;
+        }
+        if x_len == 0 {
+            panic!("device zgemv with empty x is not supported here");
+        }
+
+        unsafe {
+            magma_zgemv(
+                magma_trans_from_zgemv(trans),
+                self.rows as c_int,
+                columns as c_int,
+                alpha,
+                self.buffer.ptr,
+                self.lda,
+                x.ptr(),
+                1,
+                beta,
+                y.mut_ptr(),
+                1,
+                session.queue.raw,
+            );
+        }
+    }
+
+}
+
+#[inline]
+fn assert_column_major_contiguous(matrix: ArrayView2<'_, Complex64>, context: &str) {
+    let (rows, columns) = matrix.dim();
+    let strides = matrix.strides();
+    assert!(
+        rows <= 1 || strides[0] == 1,
+        "{context} expects column-major matrix storage"
+    );
+    assert!(
+        columns <= 1 || strides[1] == rows as isize,
+        "{context} expects column-major matrix storage"
+    );
+    matrix
+        .as_slice_memory_order()
+        .expect("column-major matrix must be contiguous");
 }
 
 pub fn zgemm(
@@ -297,98 +760,42 @@ pub fn zgemm(
     let (b_effective_rows, b_effective_columns) = transposed_shape(b_rows, b_columns, trans_b);
     assert_eq!(a_effective_columns, b_effective_rows);
 
-    let a_strides = a.strides();
-    assert!(
-        a_rows <= 1 || a_strides[0] == 1,
-        "zgemm expects column-major left matrix storage"
-    );
-    assert!(
-        a_columns <= 1 || a_strides[1] == a_rows as isize,
-        "zgemm expects column-major left matrix storage"
-    );
-    let b_strides = b.strides();
-    assert!(
-        b_rows <= 1 || b_strides[0] == 1,
-        "zgemm expects column-major right matrix storage"
-    );
-    assert!(
-        b_columns <= 1 || b_strides[1] == b_rows as isize,
-        "zgemm expects column-major right matrix storage"
-    );
+    assert_column_major_contiguous(a, "zgemm left matrix");
+    assert_column_major_contiguous(b, "zgemm right matrix");
 
-    let a_memory = a
-        .as_slice_memory_order()
-        .expect("zgemm expects contiguous left matrix storage");
-    let b_memory = b
-        .as_slice_memory_order()
-        .expect("zgemm expects contiguous right matrix storage");
     let mut result = Array2::zeros((a_effective_rows, b_effective_columns).f());
+    if a_effective_rows == 0 || b_effective_columns == 0 || a_effective_columns == 0 {
+        return result;
+    }
+
+    let session = MagmaSession::new();
+    let d_a = DeviceMatrix::from_column_major(&session, a);
+    let d_b = DeviceMatrix::from_column_major(&session, b);
+    let mut d_c = DeviceMatrix::new(a_effective_rows, b_effective_columns);
+
+    unsafe {
+        magma_zgemm(
+            magma_trans(trans_a),
+            magma_trans(trans_b),
+            a_effective_rows as c_int,
+            b_effective_columns as c_int,
+            a_effective_columns as c_int,
+            Complex64::new(1.0, 0.0),
+            d_a.buffer.ptr,
+            d_a.lda,
+            d_b.buffer.ptr,
+            d_b.lda,
+            Complex64::ZERO,
+            d_c.buffer.ptr,
+            d_c.lda,
+            session.queue.raw,
+        );
+    }
+
     let result_memory = result
         .as_slice_memory_order_mut()
         .expect("zgemm result must be contiguous");
-
-    let m = a_effective_rows as c_int;
-    let n = b_effective_columns as c_int;
-    let k = a_effective_columns as c_int;
-    let lda = a_rows.max(1) as c_int;
-    let ldb = b_rows.max(1) as c_int;
-    let ldc = a_effective_rows.max(1) as c_int;
-    let alpha = Complex64::new(1.0, 0.0);
-    let beta = Complex64::ZERO;
-    let transa = magma_trans(trans_a);
-    let transb = magma_trans(trans_b);
-
-    if m == 0 || n == 0 {
-        return result;
-    }
-    if k == 0 {
-        return result;
-    }
-
-    let queue = Queue::new();
-    let d_a = DeviceBuffer::new(a_memory.len());
-    let d_b = DeviceBuffer::new(b_memory.len());
-    let d_c = DeviceBuffer::new(result_memory.len());
-
-    unsafe {
-        magma_zsetmatrix(
-            a_rows as c_int,
-            a_columns as c_int,
-            a_memory.as_ptr(),
-            lda,
-            d_a.ptr,
-            lda,
-            queue.raw,
-        );
-        magma_zsetmatrix(
-            b_rows as c_int,
-            b_columns as c_int,
-            b_memory.as_ptr(),
-            ldb,
-            d_b.ptr,
-            ldb,
-            queue.raw,
-        );
-        magma_zsetmatrix(m, n, result_memory.as_ptr(), ldc, d_c.ptr, ldc, queue.raw);
-        magma_zgemm(
-            transa,
-            transb,
-            m,
-            n,
-            k,
-            alpha,
-            d_a.ptr,
-            lda,
-            d_b.ptr,
-            ldb,
-            beta,
-            d_c.ptr,
-            ldc,
-            queue.raw,
-        );
-        magma_zgetmatrix(m, n, d_c.ptr, ldc, result_memory.as_mut_ptr(), ldc, queue.raw);
-    }
-
+    d_c.copy_to_column_major(&session, result_memory);
     result
 }
 
@@ -401,18 +808,7 @@ pub fn zgemv(
     y: &mut [Complex64],
 ) {
     let (rows, columns) = matrix.dim();
-    let strides = matrix.strides();
-    assert!(
-        rows <= 1 || strides[0] == 1,
-        "zgemv expects column-major matrix storage"
-    );
-    assert!(
-        columns <= 1 || strides[1] == rows as isize,
-        "zgemv expects column-major matrix storage"
-    );
-    let matrix_column_major = matrix
-        .as_slice_memory_order()
-        .expect("zgemv expects contiguous matrix storage");
+    assert_column_major_contiguous(matrix, "zgemv matrix");
 
     let (x_len, y_len) = match trans {
         ZgemvTranspose::None => (columns, rows),
@@ -429,46 +825,12 @@ pub fn zgemv(
         return;
     }
 
-    let rows_i = rows as c_int;
-    let columns_i = columns as c_int;
-    let lda = rows_i.max(1);
-    let incx = 1 as c_int;
-    let incy = 1 as c_int;
-    let trans = magma_trans_from_zgemv(trans);
-
-    let queue = Queue::new();
-    let d_a = DeviceBuffer::new(matrix_column_major.len());
-    let d_x = DeviceBuffer::new(x.len());
-    let d_y = DeviceBuffer::new(y.len());
-
-    unsafe {
-        magma_zsetmatrix(
-            rows_i,
-            columns_i,
-            matrix_column_major.as_ptr(),
-            lda,
-            d_a.ptr,
-            lda,
-            queue.raw,
-        );
-        magma_zsetvector(x_len as c_int, x.as_ptr(), incx, d_x.ptr, incx, queue.raw);
-        magma_zsetvector(y_len as c_int, y.as_ptr(), incy, d_y.ptr, incy, queue.raw);
-        magma_zgemv(
-            trans,
-            rows_i,
-            columns_i,
-            alpha,
-            d_a.ptr,
-            lda,
-            d_x.ptr,
-            incx,
-            beta,
-            d_y.ptr,
-            incy,
-            queue.raw,
-        );
-        magma_zgetvector(y_len as c_int, d_y.ptr, incy, y.as_mut_ptr(), incy, queue.raw);
-    }
+    let session = MagmaSession::new();
+    let d_matrix = DeviceMatrix::from_column_major(&session, matrix);
+    let d_x = DeviceVector::from_slice(&session, x);
+    let mut d_y = DeviceVector::from_slice(&session, y);
+    d_matrix.zgemv(&session, trans, alpha, &d_x, beta, &mut d_y);
+    d_y.copy_to_slice(&session, y);
 }
 
 fn scale_slice(values: &mut [Complex64], beta: Complex64) {
@@ -476,13 +838,6 @@ fn scale_slice(values: &mut [Complex64], beta: Complex64) {
         values.fill(Complex64::ZERO);
     } else {
         values.iter_mut().for_each(|value| *value *= beta);
-    }
-}
-
-fn magma_trans_from_zgemv(trans: ZgemvTranspose) -> c_int {
-    match trans {
-        ZgemvTranspose::None => MAGMA_NO_TRANS,
-        ZgemvTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
     }
 }
 

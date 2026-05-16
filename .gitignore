@@ -41,8 +41,9 @@ perf.data.old
 # Temp
 tmp/
 temp/
+*.sh
 
-
+**/*.txt
 **/*/convdiff_report.txt
 convdiff_report.txt
 */convdiff_report.txt

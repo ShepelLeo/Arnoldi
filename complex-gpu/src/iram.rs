@@ -187,25 +187,28 @@ fn implicit_restart_and_extend(
     let (rotation, h) = shifted_qr_filter(&factorization.square_hessenberg(), shifts)
         .map_err(IramError::Spectral)?;
 
-    let rotated_basis = rotate_basis(&factorization.basis.slice(s![.., ..m]), &rotation, k);
+    // Compute [V_m Q(:,0:k-1), V_m Q(:,k)] in one MAGMA zgemm.
+    // The old code performed a CPU ndarray dot for the retained basis and then
+    // another CPU matrix-vector product for the residual. A single GEMM is both
+    // more GPU-friendly and copies V_m to the device only once.
+    let rotated_block = rotate_basis_block(&factorization.basis.slice(s![.., ..m]), &rotation, k + 1);
+    let mut rotated_basis = Array2::<Complex64>::zeros((factorization.basis.nrows(), k).f());
+    rotated_basis
+        .slice_mut(s![.., ..k])
+        .assign(&rotated_block.slice(s![.., ..k]));
+
     let mut restarted_hessenberg =
         Array2::<Complex64>::from_elem((target_steps + 1, target_steps), Complex64::ZERO);
 
-    (0..k).for_each(|column| {
-        (0..k).for_each(|row| {
-            restarted_hessenberg[[row, column]] = h[[row, column]];
-        });
-    });
+    restarted_hessenberg
+        .slice_mut(s![0..=k, 0..k])
+        .assign(&h.slice(s![0..=k, 0..k]));
 
     // r_new = h_{k+1,k} * (V_m q_{k+1}) + beta * q_{m,k} * v_{m+1}
     let h_coupling = h[(k, k - 1)];
     let residual_coupling = Complex64::new(beta, 0.0) * rotation[[m - 1, k - 1]];
 
-    let mut residual = factorization
-        .basis
-        .slice(s![.., ..m])
-        .dot(&rotation.column(k));
-
+    let mut residual = rotated_block.column(k).to_owned();
     residual *= h_coupling;
     residual.scaled_add(residual_coupling, &factorization.basis.column(m));
 
@@ -253,15 +256,17 @@ fn implicit_restart_and_extend(
     )
 }
 
-fn rotate_basis(
+fn rotate_basis_block(
     basis: &ArrayView2<Complex64>,
     q_total: &Array2<Complex64>,
-    column: usize,
+    columns: usize,
 ) -> Array2<Complex64> {
-    let product = basis.dot(&q_total.slice(s![.., 0..column]));
-    let mut result = Array2::zeros((product.nrows(), product.ncols()).f());
-    result.assign(&product);
-    result
+    zgemm(
+        ZgemmTranspose::None,
+        ZgemmTranspose::None,
+        *basis,
+        q_total.slice(s![.., 0..columns]),
+    )
 }
 
 #[cfg(test)]

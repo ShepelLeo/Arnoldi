@@ -3,7 +3,10 @@ use ndarray::{Array1, Array2, ShapeBuilder, s};
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::ops::{norm2, normalize, orthogonalize_with_reorthogonalization};
+use crate::linalg::magma::{DeviceMatrix, DeviceVector, MagmaSession};
+use crate::linalg::ops::{
+    norm2, normalize, orthogonalize_with_device_basis_reorthogonalization,
+};
 use crate::operator::LinearOperator;
 
 /// Ответ процесса
@@ -57,7 +60,18 @@ pub fn run_arnoldi(
     )
 }
 
-/// Вход в процесс Арнольди, второй и последующие прогоны, пополняем пространство Крыллова
+/// Вход в процесс Арнольди, второй и последующие прогоны, пополняем пространство Крыллова.
+///
+/// MAGMA-optimized variant:
+/// - creates one MAGMA queue/session for the whole continuation loop;
+/// - uploads the current basis matrix once at the start;
+/// - appends each newly normalized Arnoldi vector to the device basis;
+/// - reuses one device candidate buffer across all Arnoldi steps.
+///
+/// The linear operator is still CPU-side because `LinearOperator::apply_into`
+/// accepts/returns ndarray views. The optimization target here is the dense
+/// Gram-Schmidt part, which previously re-uploaded the whole basis matrix in
+/// every `zgemv` call.
 pub fn continue_arnoldi(
     operator: &dyn LinearOperator,
     mut basis: Array2<Complex64>,
@@ -85,21 +99,42 @@ pub fn continue_arnoldi(
         )));
     }
 
+    if basis.nrows() != operator.dimension() {
+        return Err(IramError::InvalidConfig(format!(
+            "Arnoldi basis row count must equal operator dimension {}, got {}",
+            operator.dimension(),
+            basis.nrows(),
+        )));
+    }
+
     let mut performed_steps = start_step;
     let mut happy_breakdown = false;
+
+    let session = MagmaSession::new();
+    let mut d_basis = DeviceMatrix::from_column_major(&session, basis.view());
+    let mut d_candidate = DeviceVector::new(operator.dimension());
 
     let mut h_column = vec![Complex64::default(); target_steps];
     let mut candidate = Array1::zeros(operator.dimension());
 
     for step in start_step..target_steps {
+        // Operator application remains host-side with the current LinearOperator API.
         operator.apply_into(basis.column(step), candidate.view_mut())?;
         let candidate_old = norm2(&candidate);
         *matvec_count += 1;
 
+        let candidate_slice = candidate
+            .as_slice()
+            .expect("Arnoldi candidate must be contiguous");
+        d_candidate.copy_from_slice(&session, candidate_slice);
+
         h_column[..=step].fill(Complex64::ZERO);
-        let orthogonalized = orthogonalize_with_reorthogonalization(
+        let orthogonalized = orthogonalize_with_device_basis_reorthogonalization(
+            &session,
+            &d_basis,
+            step + 1,
             &mut candidate,
-            &basis.slice(s![.., 0..=step]),
+            &mut d_candidate,
             &mut h_column[..=step],
             candidate_old,
             breakdown_tol,
@@ -117,7 +152,14 @@ pub fn continue_arnoldi(
         }
 
         hessenberg[[step + 1, step]] = Complex64::new(orthogonalized.residual_norm, 0.0);
+
+        // Keep both host and device basis in sync. The host copy is still needed
+        // by LinearOperator::apply_into and by downstream IRAM restart logic.
         basis.column_mut(step + 1).assign(&candidate);
+        let candidate_slice = candidate
+            .as_slice()
+            .expect("Arnoldi candidate must be contiguous");
+        d_basis.copy_column_from_slice(&session, step + 1, candidate_slice);
     }
 
     Ok(ArnoldiFactorization {

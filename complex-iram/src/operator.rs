@@ -1,8 +1,8 @@
 //! Operator definitions and CSR input handling.
 //!
-//! External sparse matrices are accepted in an explicit CSR text format. Matrix
-//! Market parsing is intentionally not part of this module anymore: the selected
-//! backend receives a canonical CSR matrix and decides how to execute MatVec.
+//! External sparse matrices are accepted either as explicit CSR text or Matrix
+//! Market text. Matrix Market input is converted once into the same canonical
+//! CSR representation before the selected backend prepares the operator.
 
 use std::fmt;
 use std::fs;
@@ -57,12 +57,24 @@ impl CsrMatrix {
     pub fn from_text_file(path: impl AsRef<Path>) -> Result<Self, IramError> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)?;
-        Self::from_text(&content).map_err(|error| match error {
+        Self::from_auto_text(&content).map_err(|error| match error {
             IramError::Parse(message) => {
                 IramError::Parse(format!("{}: {message}", path.display()))
             }
             other => other,
         })
+    }
+
+    pub fn from_auto_text(content: &str) -> Result<Self, IramError> {
+        if is_matrix_market_content(content) {
+            Self::from_matrix_market_text(content)
+        } else {
+            Self::from_text(content)
+        }
+    }
+
+    pub fn from_matrix_market_text(content: &str) -> Result<Self, IramError> {
+        parse_matrix_market_as_csr(content)
     }
 
     pub fn from_text(content: &str) -> Result<Self, IramError> {
@@ -236,6 +248,419 @@ fn next_usize(tokens: &[&str], cursor: &mut usize, context: &str) -> Result<usiz
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MatrixMarketEntry {
+    row: usize,
+    column: usize,
+    value: Complex64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixMarketFormat {
+    Coordinate,
+    Array,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixMarketField {
+    Real,
+    Integer,
+    Complex,
+    Pattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixMarketSymmetry {
+    General,
+    Symmetric,
+    SkewSymmetric,
+    Hermitian,
+}
+
+fn is_matrix_market_content(content: &str) -> bool {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_start().starts_with("%%MatrixMarket"))
+}
+
+fn parse_matrix_market_as_csr(content: &str) -> Result<CsrMatrix, IramError> {
+    let mut lines = content.lines();
+    let header = lines
+        .by_ref()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| IramError::Parse("the Matrix Market file is empty".to_string()))?;
+    let (format, field, symmetry) = parse_matrix_market_header(header)?;
+
+    let data_lines = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('%'))
+        .collect::<Vec<_>>();
+    let size_line = data_lines
+        .first()
+        .ok_or_else(|| IramError::Parse("Matrix Market file is missing a size line".to_string()))?;
+    let tokens = data_lines
+        .iter()
+        .skip(1)
+        .flat_map(|line| line.split_whitespace())
+        .collect::<Vec<_>>();
+
+    let (dimension, entries) = match format {
+        MatrixMarketFormat::Coordinate => {
+            parse_matrix_market_coordinate(size_line, &tokens, field, symmetry)
+        }
+        MatrixMarketFormat::Array => parse_matrix_market_array(size_line, &tokens, field, symmetry),
+    }?;
+
+    build_csr_from_entries(dimension, entries)
+}
+
+fn parse_matrix_market_header(
+    header: &str,
+) -> Result<(MatrixMarketFormat, MatrixMarketField, MatrixMarketSymmetry), IramError> {
+    let parts = header.split_whitespace().collect::<Vec<_>>();
+
+    if parts.len() != 5
+        || !parts[0].eq_ignore_ascii_case("%%MatrixMarket")
+        || !parts[1].eq_ignore_ascii_case("matrix")
+    {
+        return Err(IramError::Parse(
+            "Matrix Market header must be '%%MatrixMarket matrix <format> <field> <symmetry>'"
+                .to_string(),
+        ));
+    }
+
+    let format = match parts[2].to_ascii_lowercase().as_str() {
+        "coordinate" => MatrixMarketFormat::Coordinate,
+        "array" => MatrixMarketFormat::Array,
+        other => {
+            return Err(IramError::Parse(format!(
+                "unsupported Matrix Market storage format '{other}'",
+            )));
+        }
+    };
+
+    let field = match parts[3].to_ascii_lowercase().as_str() {
+        "real" => MatrixMarketField::Real,
+        "integer" => MatrixMarketField::Integer,
+        "complex" => MatrixMarketField::Complex,
+        "pattern" => MatrixMarketField::Pattern,
+        other => {
+            return Err(IramError::Parse(format!(
+                "unsupported Matrix Market field '{other}'",
+            )));
+        }
+    };
+
+    let symmetry = match parts[4].to_ascii_lowercase().as_str() {
+        "general" => MatrixMarketSymmetry::General,
+        "symmetric" => MatrixMarketSymmetry::Symmetric,
+        "skew-symmetric" => MatrixMarketSymmetry::SkewSymmetric,
+        "hermitian" => MatrixMarketSymmetry::Hermitian,
+        other => {
+            return Err(IramError::Parse(format!(
+                "unsupported Matrix Market symmetry '{other}'",
+            )));
+        }
+    };
+
+    if field == MatrixMarketField::Pattern && format == MatrixMarketFormat::Array {
+        return Err(IramError::Parse(
+            "Matrix Market array format cannot use pattern field".to_string(),
+        ));
+    }
+
+    Ok((format, field, symmetry))
+}
+
+fn parse_matrix_market_coordinate(
+    size_line: &str,
+    tokens: &[&str],
+    field: MatrixMarketField,
+    symmetry: MatrixMarketSymmetry,
+) -> Result<(usize, Vec<MatrixMarketEntry>), IramError> {
+    let size = size_line.split_whitespace().collect::<Vec<_>>();
+
+    if size.len() != 3 {
+        return Err(IramError::Parse(
+            "Matrix Market coordinate size line must contain rows, columns, and nnz".to_string(),
+        ));
+    }
+
+    let rows = parse_plain_usize(size[0], "Matrix Market row count")?;
+    let columns = parse_plain_usize(size[1], "Matrix Market column count")?;
+    let nnz = parse_plain_usize(size[2], "Matrix Market nonzero count")?;
+    ensure_square_matrix(rows, columns, "Matrix Market coordinate matrix")?;
+
+    let mut entries = Vec::with_capacity(nnz);
+    let mut cursor = 0usize;
+
+    for entry_index in 0..nnz {
+        let row_token = mm_next_token(tokens, &mut cursor, "coordinate row")?;
+        let column_token = mm_next_token(tokens, &mut cursor, "coordinate column")?;
+        let row = parse_matrix_market_index(row_token, rows, "row")?;
+        let column = parse_matrix_market_index(column_token, columns, "column")?;
+        let value = read_matrix_market_value(tokens, &mut cursor, field)?;
+
+        add_matrix_market_entry(&mut entries, row, column, value, symmetry).map_err(|message| {
+            IramError::Parse(format!(
+                "invalid Matrix Market coordinate entry {}: {message}",
+                entry_index + 1,
+            ))
+        })?;
+    }
+
+    ensure_no_extra_tokens(tokens, cursor, "Matrix Market coordinate data")?;
+    Ok((rows, entries))
+}
+
+fn parse_matrix_market_array(
+    size_line: &str,
+    tokens: &[&str],
+    field: MatrixMarketField,
+    symmetry: MatrixMarketSymmetry,
+) -> Result<(usize, Vec<MatrixMarketEntry>), IramError> {
+    let size = size_line.split_whitespace().collect::<Vec<_>>();
+
+    if size.len() != 2 {
+        return Err(IramError::Parse(
+            "Matrix Market array size line must contain rows and columns".to_string(),
+        ));
+    }
+
+    let rows = parse_plain_usize(size[0], "Matrix Market row count")?;
+    let columns = parse_plain_usize(size[1], "Matrix Market column count")?;
+    ensure_square_matrix(rows, columns, "Matrix Market array matrix")?;
+
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+
+    match symmetry {
+        MatrixMarketSymmetry::General => {
+            for column in 0..columns {
+                for row in 0..rows {
+                    let value = read_matrix_market_value(tokens, &mut cursor, field)?;
+                    add_matrix_market_entry(
+                        &mut entries,
+                        row,
+                        column,
+                        value,
+                        MatrixMarketSymmetry::General,
+                    )
+                    .map_err(IramError::Parse)?;
+                }
+            }
+        }
+        MatrixMarketSymmetry::Symmetric | MatrixMarketSymmetry::Hermitian => {
+            for column in 0..columns {
+                for row in column..rows {
+                    let value = read_matrix_market_value(tokens, &mut cursor, field)?;
+                    add_matrix_market_entry(&mut entries, row, column, value, symmetry)
+                        .map_err(IramError::Parse)?;
+                }
+            }
+        }
+        MatrixMarketSymmetry::SkewSymmetric => {
+            for column in 0..columns {
+                for row in (column + 1)..rows {
+                    let value = read_matrix_market_value(tokens, &mut cursor, field)?;
+                    add_matrix_market_entry(&mut entries, row, column, value, symmetry)
+                        .map_err(IramError::Parse)?;
+                }
+            }
+        }
+    }
+
+    ensure_no_extra_tokens(tokens, cursor, "Matrix Market array data")?;
+    Ok((rows, entries))
+}
+
+fn build_csr_from_entries(
+    dimension: usize,
+    mut entries: Vec<MatrixMarketEntry>,
+) -> Result<CsrMatrix, IramError> {
+    entries.sort_unstable_by_key(|entry| (entry.row, entry.column));
+
+    let mut row_offsets = Vec::with_capacity(dimension + 1);
+    let mut column_indices = Vec::new();
+    let mut values = Vec::new();
+    row_offsets.push(0);
+
+    let mut cursor = 0usize;
+    for row in 0..dimension {
+        while cursor < entries.len() && entries[cursor].row == row {
+            let column = entries[cursor].column;
+            let mut value = Complex64::ZERO;
+            while cursor < entries.len()
+                && entries[cursor].row == row
+                && entries[cursor].column == column
+            {
+                value += entries[cursor].value;
+                cursor += 1;
+            }
+            if value != Complex64::ZERO {
+                column_indices.push(column);
+                values.push(value);
+            }
+        }
+        row_offsets.push(column_indices.len());
+    }
+
+    CsrMatrix::new(dimension, dimension, row_offsets, column_indices, values)
+}
+
+fn read_matrix_market_value(
+    tokens: &[&str],
+    cursor: &mut usize,
+    field: MatrixMarketField,
+) -> Result<Complex64, IramError> {
+    match field {
+        MatrixMarketField::Real | MatrixMarketField::Integer => {
+            let token = mm_next_token(tokens, cursor, "Matrix Market value")?;
+            parse_f64(token, "Matrix Market value").map(|value| Complex64::new(value, 0.0))
+        }
+        MatrixMarketField::Complex => {
+            let real_token = mm_next_token(tokens, cursor, "Matrix Market real part")?;
+            let imaginary_token = mm_next_token(tokens, cursor, "Matrix Market imaginary part")?;
+            let real = parse_f64(real_token, "Matrix Market real part")?;
+            let imaginary = parse_f64(imaginary_token, "Matrix Market imaginary part")?;
+            Ok(Complex64::new(real, imaginary))
+        }
+        MatrixMarketField::Pattern => Ok(Complex64::new(1.0, 0.0)),
+    }
+}
+
+fn add_matrix_market_entry(
+    entries: &mut Vec<MatrixMarketEntry>,
+    row: usize,
+    column: usize,
+    value: Complex64,
+    symmetry: MatrixMarketSymmetry,
+) -> Result<(), String> {
+    if row == column && symmetry == MatrixMarketSymmetry::SkewSymmetric && value != Complex64::ZERO
+    {
+        return Err("skew-symmetric diagonal entries must be zero".to_string());
+    }
+
+    if row == column && symmetry == MatrixMarketSymmetry::Hermitian && value.im != 0.0 {
+        return Err("Hermitian diagonal entries must be real".to_string());
+    }
+
+    if value != Complex64::ZERO {
+        entries.push(MatrixMarketEntry { row, column, value });
+    }
+
+    if row == column {
+        return Ok(());
+    }
+
+    match symmetry {
+        MatrixMarketSymmetry::General => {}
+        MatrixMarketSymmetry::Symmetric => {
+            if value != Complex64::ZERO {
+                entries.push(MatrixMarketEntry {
+                    row: column,
+                    column: row,
+                    value,
+                });
+            }
+        }
+        MatrixMarketSymmetry::SkewSymmetric => {
+            if value != Complex64::ZERO {
+                entries.push(MatrixMarketEntry {
+                    row: column,
+                    column: row,
+                    value: -value,
+                });
+            }
+        }
+        MatrixMarketSymmetry::Hermitian => {
+            if value != Complex64::ZERO {
+                entries.push(MatrixMarketEntry {
+                    row: column,
+                    column: row,
+                    value: value.conj(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_square_matrix(rows: usize, columns: usize, context: &str) -> Result<(), IramError> {
+    if rows == 0 || columns == 0 {
+        return Err(IramError::Parse(format!("{context} is empty")));
+    }
+
+    if rows != columns {
+        return Err(IramError::Parse(format!(
+            "{context} must be square, got {rows}x{columns}",
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_matrix_market_index(
+    token: &str,
+    dimension: usize,
+    axis: &str,
+) -> Result<usize, IramError> {
+    let index = parse_plain_usize(token, axis)?;
+
+    if index == 0 || index > dimension {
+        return Err(IramError::Parse(format!(
+            "Matrix Market {axis} index {index} is outside 1..={dimension}",
+        )));
+    }
+
+    Ok(index - 1)
+}
+
+fn mm_next_token<'a>(
+    tokens: &'a [&str],
+    cursor: &mut usize,
+    context: &str,
+) -> Result<&'a str, IramError> {
+    if *cursor >= tokens.len() {
+        return Err(IramError::Parse(format!(
+            "unexpected end of Matrix Market file while reading {context}",
+        )));
+    }
+
+    let token = tokens[*cursor];
+    *cursor += 1;
+    Ok(token)
+}
+
+fn ensure_no_extra_tokens(tokens: &[&str], cursor: usize, context: &str) -> Result<(), IramError> {
+    if cursor != tokens.len() {
+        return Err(IramError::Parse(format!(
+            "{context} has {} extra token(s)",
+            tokens.len() - cursor,
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_plain_usize(token: &str, context: &str) -> Result<usize, IramError> {
+    token.parse::<usize>().map_err(|error| {
+        IramError::Parse(format!(
+            "cannot parse {context} '{token}' as an unsigned integer: {error}",
+        ))
+    })
+}
+
+fn parse_f64(token: &str, context: &str) -> Result<f64, IramError> {
+    token.parse::<f64>().map_err(|error| {
+        IramError::Parse(format!(
+            "cannot parse {context} '{token}' as a real number: {error}",
+        ))
+    })
+}
+
 /// Linear operator interface retained for host-side construction and LAPACK.
 /// Accelerated backends should call `to_csr`/`as_csr` during preparation and
 /// execute MatVec through their backend-specific implementation.
@@ -322,7 +747,8 @@ pub fn csr_operator_from_text_file(path: impl AsRef<Path>) -> Result<Box<dyn Lin
     CsrOperator::from_text_file(path).map(|operator| Box::new(operator) as Box<dyn LinearOperator>)
 }
 
-/// Backward-compatible name. It now expects CSR input, not Matrix Market.
+/// Backward-compatible name. Input may be explicit CSR text or Matrix Market;
+/// either way the returned operator owns a canonical CSR matrix.
 pub fn matrix_operator_from_text_file(path: impl AsRef<Path>) -> Result<Box<dyn LinearOperator>, IramError> {
     csr_operator_from_text_file(path)
 }
@@ -808,6 +1234,48 @@ mod tests {
         assert_eq!(parse_complex_token("3.5").unwrap(), Complex64::new(3.5, 0.0));
         assert_eq!(parse_complex_token("2-4i").unwrap(), Complex64::new(2.0, -4.0));
         assert_eq!(parse_complex_token("-i").unwrap(), Complex64::new(0.0, -1.0));
+    }
+
+    #[test]
+    fn matrix_market_coordinate_converts_to_csr() {
+        let matrix = CsrMatrix::from_matrix_market_text(
+            r#"
+            %%MatrixMarket matrix coordinate complex hermitian
+            % row column real imaginary
+            3 3 3
+            1 1 2.0 0.0
+            2 1 3.0 4.0
+            3 3 5.0 0.0
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(matrix.rows(), 3);
+        assert_eq!(matrix.columns(), 3);
+        assert_eq!(matrix.row_offsets(), &[0, 2, 3, 4]);
+        assert_eq!(matrix.column_indices(), &[0, 1, 0, 2]);
+        assert_eq!(matrix.values()[0], Complex64::new(2.0, 0.0));
+        assert_eq!(matrix.values()[1], Complex64::new(3.0, -4.0));
+        assert_eq!(matrix.values()[2], Complex64::new(3.0, 4.0));
+        assert_eq!(matrix.values()[3], Complex64::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn matrix_market_duplicate_entries_are_summed() {
+        let matrix = CsrMatrix::from_matrix_market_text(
+            r#"
+            %%MatrixMarket matrix coordinate real general
+            2 2 3
+            1 2 1.5
+            1 2 2.5
+            2 1 -1.0
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(matrix.row_offsets(), &[0, 1, 2]);
+        assert_eq!(matrix.column_indices(), &[1, 0]);
+        assert_eq!(matrix.values(), &[Complex64::new(4.0, 0.0), Complex64::new(-1.0, 0.0)]);
     }
 
     #[test]

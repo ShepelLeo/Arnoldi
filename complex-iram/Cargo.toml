@@ -11,6 +11,8 @@ doctest = false
 default = ["lapack"]
 lapack = []
 magma = []
+# Use only with a MAGMA build where magma_int_t/magma_index_t are 64-bit.
+magma-ilp64 = ["magma"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

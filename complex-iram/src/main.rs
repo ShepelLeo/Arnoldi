@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = OperatorArg::Identity)]
     operator: OperatorArg,
 
-    /// Файл с CSR-матрицей
+    /// Файл с матрицей: явный CSR text или Matrix Market .mtx; внутри приводится к CSR
     #[arg(long)]
     matrix_file: Option<PathBuf>,
 

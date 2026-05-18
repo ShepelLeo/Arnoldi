@@ -8,7 +8,6 @@ use crate::backend::{Backend, LapackBackend};
 use crate::config::SolverConfig;
 use crate::error::IramError;
 use crate::linalg::ops::normalize;
-use crate::linalg::shifted_qr::shifted_qr_filter;
 use crate::memory;
 use crate::operator::LinearOperator;
 use crate::report::{IterationLog, RitzEstimate, SolveReport};
@@ -33,7 +32,9 @@ pub fn solve_with_backend<B: Backend>(
     config: SolverConfig,
     start_description: impl Into<String>,
 ) -> Result<SolveReport, IramError> {
-    config.validate(operator.dimension())?;
+    let prepared_operator = backend.prepare_operator(operator)?;
+    let dimension = backend.prepared_operator_dimension(&prepared_operator);
+    config.validate(dimension)?;
 
     // Инициализируем стартовый вектор
     let mut current_start = start_vector;
@@ -43,7 +44,7 @@ pub fn solve_with_backend<B: Backend>(
     // Запуск процесса Арнольди
     let mut factorization = run_arnoldi(
         backend,
-        operator,
+        &prepared_operator,
         &current_start,
         config.ncv,
         config.breakdown_tol,
@@ -150,7 +151,7 @@ pub fn solve_with_backend<B: Backend>(
         // Запускаем рестарты
         factorization = implicit_restart_and_extend(
             backend,
-            operator,
+            &prepared_operator,
             &factorization,
             &selection.shifts,
             config.ncv + converged,
@@ -161,9 +162,9 @@ pub fn solve_with_backend<B: Backend>(
     }
 
     Ok(SolveReport {
-        operator_description: format!("{} [{} backend]", operator.description(), backend.name()),
+        operator_description: format!("{} [{} backend]", backend.prepared_operator_description(&prepared_operator), backend.name()),
         start_description: start_description.into(),
-        dimension: operator.dimension(),
+        dimension,
         config,
         elapsed_seconds: 0.0,
         total_restarts: history.len(),
@@ -185,7 +186,7 @@ pub fn solve_with_backend<B: Backend>(
 /// Вход в рестарты
 fn implicit_restart_and_extend<B: Backend>(
     backend: &mut B,
-    operator: &dyn LinearOperator,
+    operator: &B::PreparedOperator<'_>,
     factorization: &ArnoldiFactorization,
     shifts: &[Complex64],
     target_steps: usize,
@@ -209,8 +210,7 @@ fn implicit_restart_and_extend<B: Backend>(
 
     // A V_m = V_m H_m + beta v_{m+1} e_m^T
     let beta = factorization.trailing_subdiagonal();
-    let (rotation, h) = shifted_qr_filter(&factorization.square_hessenberg(), shifts)
-        .map_err(IramError::Spectral)?;
+    let (rotation, h) = backend.shifted_qr_filter(&factorization.square_hessenberg(), shifts)?;
 
     // Compute [V_m Q(:,0:k-1), V_m Q(:,k)] in one backend GEMM.
     let rotated_block = rotate_basis_block(
@@ -325,7 +325,7 @@ mod tests {
             max_restarts: 5,
             tol: 1.0e-10,
             breakdown_tol: 1.0e-12,
-            ritz_inflation: 1.0,
+            ritz_inflation: Some(1.0),
             target: SpectrumTarget::LargestMagnitude,
         };
         let report = solve(&operator, start, config, "unit vector")
@@ -348,7 +348,7 @@ mod tests {
             max_restarts: 20,
             tol: 1.0e-10,
             breakdown_tol: 1.0e-12,
-            ritz_inflation: 1.0,
+            ritz_inflation: Some(1.0),
             target: SpectrumTarget::SmallestMagnitude,
         };
 

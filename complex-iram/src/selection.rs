@@ -121,7 +121,7 @@ fn base_selection(
 
 fn topology_cluster(
     values: &[Complex64], 
-    wanted: &Vec<usize>, 
+    wanted: &[usize], 
     target: SpectrumTarget, 
     inflation: f64) -> Vec<Complex64>{
     match target {
@@ -293,7 +293,7 @@ mod tests {
             Complex64::new(-4.0, 0.0),
         ];
 
-        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, 1.0)
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, Some(1.0))
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted.len(), 2);
@@ -309,7 +309,7 @@ mod tests {
             Complex64::new(0.0, 0.0),
         ];
 
-        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, 3.0)
+        let selection = select_ritz_values(&values, SpectrumTarget::LargestReal, 2, 4, Some(3.0))
             .expect("selection should succeed");
 
         assert_eq!(selection.wanted, vec![0, 1]);

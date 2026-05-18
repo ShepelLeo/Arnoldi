@@ -11,7 +11,7 @@ use complex_iram::linalg::ops::{normalize, normalized_random_vector};
 use complex_iram::memory;
 use complex_iram::operator::{
     ConvectionDiffusionOperator, GrcarOperator, IdentityOperator, LinearOperator,
-    matrix_operator_from_text_file, parse_complex_token,
+    csr_operator_from_text_file, parse_complex_token,
 };
 use complex_iram::{IramError, LapackBackend, solve_with_backend};
 #[cfg(feature = "magma")]
@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = OperatorArg::Identity)]
     operator: OperatorArg,
 
-    /// Файл с плотной матрицей
+    /// Файл с CSR-матрицей
     #[arg(long)]
     matrix_file: Option<PathBuf>,
 
@@ -195,7 +195,7 @@ fn run() -> Result<(), IramError> {
 
 fn build_operator(cli: &Cli) -> Result<Box<dyn LinearOperator>, IramError> {
     if let Some(matrix_file) = &cli.matrix_file {
-        return matrix_operator_from_text_file(matrix_file);
+        return csr_operator_from_text_file(matrix_file);
     }
 
     match cli.operator {

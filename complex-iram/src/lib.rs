@@ -19,7 +19,8 @@ pub use config::{SolverConfig, SpectrumTarget, recommended_ncv};
 pub use error::IramError;
 pub use iram::{solve, solve_with_backend};
 pub use operator::{
-    ConvectionDiffusionOperator, DenseMatrixOperator, FnOperator, GrcarOperator, IdentityOperator,
-    LinearOperator, MatrixMarketOperator, matrix_operator_from_text_file, parse_complex_token,
+    ConvectionDiffusionOperator, CsrMatrix, CsrOperator, DenseMatrixOperator, FnOperator,
+    GrcarOperator, IdentityOperator, LinearOperator, csr_operator_from_text_file,
+    matrix_operator_from_text_file, parse_complex_token,
 };
 pub use report::{IterationLog, RitzEstimate, SolveReport};

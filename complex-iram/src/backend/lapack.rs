@@ -4,7 +4,9 @@ use num_complex::Complex64;
 use crate::backend::Backend;
 use crate::error::IramError;
 use crate::linalg::lapack::{self, SchurOutput, ZgemmTranspose};
-use crate::linalg::ops::{OrthogonalizedVector, orthogonalize_with_reorthogonalization};
+use crate::linalg::ops::{norm2, OrthogonalizedVector, orthogonalize_with_reorthogonalization};
+use crate::linalg::shifted_qr::shifted_qr_filter;
+use crate::operator::LinearOperator;
 
 #[derive(Debug, Default)]
 pub struct LapackBackend;
@@ -16,11 +18,28 @@ impl LapackBackend {
 }
 
 impl Backend for LapackBackend {
+    type PreparedOperator<'operator> = &'operator dyn LinearOperator where Self: 'operator;
     type ArnoldiWorkspace = ();
     type RitzDecomposition = SchurOutput;
 
     fn name(&self) -> &'static str {
         "lapack"
+    }
+
+
+    fn prepare_operator<'operator>(
+        &mut self,
+        operator: &'operator dyn LinearOperator,
+    ) -> Result<Self::PreparedOperator<'operator>, IramError> {
+        Ok(operator)
+    }
+
+    fn prepared_operator_dimension(&self, operator: &Self::PreparedOperator<'_>) -> usize {
+        (**operator).dimension()
+    }
+
+    fn prepared_operator_description(&self, operator: &Self::PreparedOperator<'_>) -> String {
+        (**operator).description()
     }
 
     fn create_arnoldi_workspace(
@@ -29,6 +48,19 @@ impl Backend for LapackBackend {
         _dimension: usize,
     ) -> Result<Self::ArnoldiWorkspace, IramError> {
         Ok(())
+    }
+
+
+    fn apply_operator_to_arnoldi_column(
+        &mut self,
+        operator: &Self::PreparedOperator<'_>,
+        _workspace: &mut Self::ArnoldiWorkspace,
+        basis: &Array2<Complex64>,
+        column: usize,
+        candidate: &mut Array1<Complex64>,
+    ) -> Result<f64, IramError> {
+        (**operator).apply_into(basis.column(column), candidate.view_mut())?;
+        Ok(norm2(candidate))
     }
 
     fn orthogonalize_arnoldi_candidate(
@@ -73,6 +105,15 @@ impl Backend for LapackBackend {
             reference_norm,
             breakdown_tol,
         )
+    }
+
+
+    fn shifted_qr_filter(
+        &mut self,
+        hessenberg: &Array2<Complex64>,
+        shifts: &[Complex64],
+    ) -> Result<(Array2<Complex64>, Array2<Complex64>), IramError> {
+        shifted_qr_filter(hessenberg, shifts).map_err(IramError::Spectral)
     }
 
     fn compute_ritz_values(

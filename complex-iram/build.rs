@@ -9,9 +9,11 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_MAGMA").is_some() {
         if let Ok(dir) = std::env::var("MAGMA_LIB_DIR") {
             println!("cargo:rustc-link-search=native={dir}");
+            println!("cargo:rustc-link-lib=dylib=magma_sparse");
             println!("cargo:rustc-link-lib=dylib=magma");
         } else if let Ok(dir) = std::env::var("MAGMA_DIR") {
             println!("cargo:rustc-link-search=native={dir}/lib");
+            println!("cargo:rustc-link-lib=dylib=magma_sparse");
             println!("cargo:rustc-link-lib=dylib=magma");
         } else {
             panic!(

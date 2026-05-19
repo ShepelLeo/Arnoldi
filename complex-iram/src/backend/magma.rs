@@ -7,24 +7,20 @@ use crate::linalg::magma::{
     self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, MagmaSession, SchurOutput, ZgemmTranspose,
 };
 use crate::linalg::ops::{
-    norm2, OrthogonalizedVector, orthogonalize_with_device_basis_reorthogonalization,
+    OrthogonalizedVector, orthogonalize_with_device_basis_reorthogonalization,
     orthogonalize_with_magma_reorthogonalization,
 };
-use crate::operator::{CsrMatrix, LinearOperator};
+use crate::operator::LinearOperator;
+
+pub struct MagmaOperatorWorkspace {
+    d_operator: DeviceCsrMatrix,
+}
 
 pub struct MagmaArnoldiWorkspace {
     d_basis: DeviceMatrix,
     d_candidate: DeviceVector,
     d_projection: DeviceVector,
     projection: Vec<Complex64>,
-    candidate_is_device_current: bool,
-}
-
-pub struct MagmaPreparedOperator {
-    dimension: usize,
-    description: String,
-    _host_csr: CsrMatrix,
-    d_csr: DeviceCsrMatrix,
 }
 
 pub struct MagmaBackend {
@@ -46,7 +42,7 @@ impl Default for MagmaBackend {
 }
 
 impl Backend for MagmaBackend {
-    type PreparedOperator<'operator> = MagmaPreparedOperator where Self: 'operator;
+    type OperatorWorkspace = MagmaOperatorWorkspace;
     type ArnoldiWorkspace = MagmaArnoldiWorkspace;
     type RitzDecomposition = SchurOutput;
 
@@ -54,41 +50,28 @@ impl Backend for MagmaBackend {
         "magma"
     }
 
-    fn prepare_operator<'operator>(
+    fn prepare_operator(
         &mut self,
-        operator: &'operator dyn LinearOperator,
-    ) -> Result<Self::PreparedOperator<'operator>, IramError> {
-        let csr = operator.as_csr().cloned().or_else(|| operator.to_csr()).ok_or_else(|| {
+        operator: &dyn LinearOperator,
+    ) -> Result<Self::OperatorWorkspace, IramError> {
+        let csr = operator.csr_matrix().ok_or_else(|| {
             IramError::InvalidConfig(format!(
-                "operator '{}' cannot be prepared for MAGMA: it does not expose CSR storage",
+                "MAGMA backend requires a CSR-materializable operator for cuSPARSE matvec; '{}' does not provide one",
                 operator.description(),
             ))
         })?;
+        csr.validate()?;
 
-        let d_csr = DeviceCsrMatrix::from_csr(
+        let d_operator = DeviceCsrMatrix::from_csr(
             &self.session,
-            csr.rows(),
-            csr.columns(),
-            csr.row_offsets(),
-            csr.column_indices(),
-            csr.values(),
+            csr.dimension,
+            &csr.row_offsets,
+            &csr.columns,
+            &csr.values,
         )
-        .map_err(|error| IramError::Spectral(format!("MAGMA CSR upload failed: {error:?}")))?;
+        .map_err(|error| IramError::Spectral(format!("cuSPARSE CSR upload failed: {error:?}")))?;
 
-        Ok(MagmaPreparedOperator {
-            dimension: csr.rows(),
-            description: operator.description(),
-            _host_csr: csr,
-            d_csr,
-        })
-    }
-
-    fn prepared_operator_dimension(&self, operator: &Self::PreparedOperator<'_>) -> usize {
-        operator.dimension
-    }
-
-    fn prepared_operator_description(&self, operator: &Self::PreparedOperator<'_>) -> String {
-        operator.description.clone()
+        Ok(MagmaOperatorWorkspace { d_operator })
     }
 
     fn create_arnoldi_workspace(
@@ -101,36 +84,32 @@ impl Backend for MagmaBackend {
             d_candidate: DeviceVector::new(dimension),
             d_projection: DeviceVector::new(basis.ncols()),
             projection: vec![Complex64::ZERO; basis.ncols()],
-            candidate_is_device_current: false,
         })
     }
 
-    fn apply_operator_to_arnoldi_column(
+    fn apply_operator_to_basis_vector(
         &mut self,
-        operator: &Self::PreparedOperator<'_>,
-        workspace: &mut Self::ArnoldiWorkspace,
+        operator_workspace: &mut Self::OperatorWorkspace,
+        arnoldi_workspace: &mut Self::ArnoldiWorkspace,
+        _operator: &dyn LinearOperator,
         _basis: &Array2<Complex64>,
         column: usize,
-        candidate: &mut Array1<Complex64>,
-    ) -> Result<f64, IramError> {
-        operator
-            .d_csr
-            .spmv_from_matrix_column(
-                &self.session,
-                &workspace.d_basis,
-                column,
-                &mut workspace.d_candidate,
-            )
-            .map_err(|error| IramError::Spectral(format!("MAGMA CSR SpMV failed: {error:?}")))?;
+        output: &mut Array1<Complex64>,
+    ) -> Result<(), IramError> {
+        let x = arnoldi_workspace.d_basis.column_ptr(column);
+        let y = arnoldi_workspace.d_candidate.mut_ptr();
+        operator_workspace
+            .d_operator
+            .spmv_raw(&self.session, x, y)
+            .map_err(|error| IramError::Spectral(format!("cuSPARSE SpMV failed: {error:?}")))?;
 
-        let candidate_slice = candidate
+        let output_slice = output
             .as_slice_mut()
             .expect("Arnoldi candidate must be contiguous");
-        workspace
+        arnoldi_workspace
             .d_candidate
-            .copy_to_slice(&self.session, candidate_slice);
-        workspace.candidate_is_device_current = true;
-        Ok(norm2(candidate))
+            .copy_to_slice(&self.session, output_slice);
+        Ok(())
     }
 
     fn orthogonalize_arnoldi_candidate(
@@ -143,16 +122,14 @@ impl Backend for MagmaBackend {
         reference_norm: f64,
         breakdown_tol: f64,
     ) -> OrthogonalizedVector {
-        if !workspace.candidate_is_device_current {
-            let candidate_slice = candidate
-                .as_slice()
-                .expect("Arnoldi candidate must be contiguous");
-            workspace
-                .d_candidate
-                .copy_from_slice(&self.session, candidate_slice);
-        }
-
-        let result = orthogonalize_with_device_basis_reorthogonalization(
+        // `apply_operator_to_basis_vector` has already written the candidate to
+        // `workspace.d_candidate`. Re-uploading `candidate` here creates a full
+        // host -> device copy on every Arnoldi step and cancels much of the
+        // benefit of doing matvec on the GPU.
+        //
+        // The host `candidate` remains a mirror used for norm/breakdown logic;
+        // the device vector is the source of truth for the BLAS projections.
+        orthogonalize_with_device_basis_reorthogonalization(
             &self.session,
             &workspace.d_basis,
             basis_columns,
@@ -163,9 +140,7 @@ impl Backend for MagmaBackend {
             h_column,
             reference_norm,
             breakdown_tol,
-        );
-        workspace.candidate_is_device_current = true;
-        result
+        )
     }
 
     fn append_arnoldi_basis_column(
@@ -180,7 +155,6 @@ impl Backend for MagmaBackend {
         workspace
             .d_basis
             .copy_column_from_slice(&self.session, column, values);
-        workspace.candidate_is_device_current = false;
     }
 
     fn orthogonalize_restart_residual(
@@ -206,7 +180,12 @@ impl Backend for MagmaBackend {
         hessenberg: &Array2<Complex64>,
         shifts: &[Complex64],
     ) -> Result<(Array2<Complex64>, Array2<Complex64>), IramError> {
-        magma::shifted_qr_filter_with_session(&self.session, hessenberg, shifts)
+        // The shifted QR problem here is tiny (ncv ~= 200). The CUDA prototype
+        // moves H/Q to the device, launches a mostly serial kernel, and copies
+        // both matrices back on every restart. That is slower than the CPU path
+        // and increases device allocations/transfers, so keep QR on host until
+        // restart rotation is fused into a fully device-resident pipeline.
+        crate::linalg::shifted_qr::shifted_qr_filter(hessenberg, shifts)
             .map_err(IramError::Spectral)
     }
 

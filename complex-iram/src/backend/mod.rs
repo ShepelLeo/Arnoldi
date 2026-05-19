@@ -1,15 +1,15 @@
 //! Backend abstraction for the shared IRAM algorithm.
 //!
-//! The IRAM orchestration owns no numerical kernel directly. A selected backend
-//! must prepare the operator, perform MatVec, orthogonalize Arnoldi vectors,
-//! solve the small Ritz problem, run the implicit shifted-QR restart filter, and
-//! multiply dense basis blocks.
+//! The algorithm calls this trait in readable places: operator preparation,
+//! Arnoldi workspace creation, backend matvec, basis orthogonalization, shifted
+//! QR restart filtering, small Ritz solve, Ritz vector extraction and dense
+//! matrix products. Concrete backends keep their LAPACK/MAGMA/cuSPARSE details here.
 
 use ndarray::{Array1, Array2, ArrayView2};
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::ops::OrthogonalizedVector;
+use crate::linalg::ops::{self, OrthogonalizedVector};
 use crate::operator::LinearOperator;
 
 pub mod lapack;
@@ -21,22 +21,16 @@ pub use lapack::LapackBackend;
 pub use magma::MagmaBackend;
 
 pub trait Backend {
-    type PreparedOperator<'operator>
-    where
-        Self: 'operator;
+    type OperatorWorkspace;
     type ArnoldiWorkspace;
     type RitzDecomposition;
 
     fn name(&self) -> &'static str;
 
-    fn prepare_operator<'operator>(
+    fn prepare_operator(
         &mut self,
-        operator: &'operator dyn LinearOperator,
-    ) -> Result<Self::PreparedOperator<'operator>, IramError>;
-
-    fn prepared_operator_dimension(&self, operator: &Self::PreparedOperator<'_>) -> usize;
-
-    fn prepared_operator_description(&self, operator: &Self::PreparedOperator<'_>) -> String;
+        operator: &dyn LinearOperator,
+    ) -> Result<Self::OperatorWorkspace, IramError>;
 
     fn create_arnoldi_workspace(
         &mut self,
@@ -44,18 +38,19 @@ pub trait Backend {
         dimension: usize,
     ) -> Result<Self::ArnoldiWorkspace, IramError>;
 
-    /// Computes `candidate = A * basis[:, column]` using the selected backend.
+    /// Backend-owned matrix-vector product used by Arnoldi.
     ///
-    /// The return value is the norm of the unorthogonalized candidate and is used
-    /// as Arnoldi's reference norm for numerical-breakdown detection.
-    fn apply_operator_to_arnoldi_column(
+    /// LAPACK applies the host-side `LinearOperator`. MAGMA can keep a prepared
+    /// CSR descriptor on the device and call cuSPARSE against a basis column.
+    fn apply_operator_to_basis_vector(
         &mut self,
-        operator: &Self::PreparedOperator<'_>,
-        workspace: &mut Self::ArnoldiWorkspace,
+        operator_workspace: &mut Self::OperatorWorkspace,
+        arnoldi_workspace: &mut Self::ArnoldiWorkspace,
+        operator: &dyn LinearOperator,
         basis: &Array2<Complex64>,
         column: usize,
-        candidate: &mut Array1<Complex64>,
-    ) -> Result<f64, IramError>;
+        output: &mut Array1<Complex64>,
+    ) -> Result<(), IramError>;
 
     fn orthogonalize_arnoldi_candidate(
         &mut self,
@@ -109,4 +104,29 @@ pub trait Backend {
         a: ArrayView2<'_, Complex64>,
         b: ArrayView2<'_, Complex64>,
     ) -> Array2<Complex64>;
+
+    fn vector_norm2(&mut self, vector: &Array1<Complex64>) -> f64 {
+        ops::norm2(vector)
+    }
+
+    fn normalize_vector(
+        &mut self,
+        vector: &mut Array1<Complex64>,
+        context: &'static str,
+    ) -> Result<f64, IramError> {
+        ops::normalize(vector, context)
+    }
+
+    fn scale_vector_in_place(&mut self, vector: &mut Array1<Complex64>, alpha: Complex64) {
+        ops::scale_in_place(vector, alpha);
+    }
+
+    fn add_scaled_vector_in_place(
+        &mut self,
+        target: &mut Array1<Complex64>,
+        alpha: Complex64,
+        source: &Array1<Complex64>,
+    ) {
+        ops::axpy_in_place(target, alpha, source);
+    }
 }

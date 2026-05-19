@@ -7,7 +7,6 @@ use crate::arnoldi::{ArnoldiFactorization, continue_arnoldi, run_arnoldi};
 use crate::backend::{Backend, LapackBackend};
 use crate::config::SolverConfig;
 use crate::error::IramError;
-use crate::linalg::ops::normalize;
 use crate::memory;
 use crate::operator::LinearOperator;
 use crate::report::{IterationLog, RitzEstimate, SolveReport};
@@ -32,19 +31,19 @@ pub fn solve_with_backend<B: Backend>(
     config: SolverConfig,
     start_description: impl Into<String>,
 ) -> Result<SolveReport, IramError> {
-    let prepared_operator = backend.prepare_operator(operator)?;
-    let dimension = backend.prepared_operator_dimension(&prepared_operator);
-    config.validate(dimension)?;
+    config.validate(operator.dimension())?;
 
     // Инициализируем стартовый вектор
     let mut current_start = start_vector;
-    normalize(&mut current_start, "solver start vector")?;
+    backend.normalize_vector(&mut current_start, "solver start vector")?;
 
+    let mut operator_workspace = backend.prepare_operator(operator)?;
     let mut total_matvecs = 0usize;
     // Запуск процесса Арнольди
     let mut factorization = run_arnoldi(
         backend,
-        &prepared_operator,
+        &mut operator_workspace,
+        operator,
         &current_start,
         config.ncv,
         config.breakdown_tol,
@@ -151,7 +150,8 @@ pub fn solve_with_backend<B: Backend>(
         // Запускаем рестарты
         factorization = implicit_restart_and_extend(
             backend,
-            &prepared_operator,
+            &mut operator_workspace,
+            operator,
             &factorization,
             &selection.shifts,
             config.ncv + converged,
@@ -162,9 +162,9 @@ pub fn solve_with_backend<B: Backend>(
     }
 
     Ok(SolveReport {
-        operator_description: format!("{} [{} backend]", backend.prepared_operator_description(&prepared_operator), backend.name()),
+        operator_description: format!("{} [{} backend]", operator.description(), backend.name()),
         start_description: start_description.into(),
-        dimension,
+        dimension: operator.dimension(),
         config,
         elapsed_seconds: 0.0,
         total_restarts: history.len(),
@@ -186,7 +186,8 @@ pub fn solve_with_backend<B: Backend>(
 /// Вход в рестарты
 fn implicit_restart_and_extend<B: Backend>(
     backend: &mut B,
-    operator: &B::PreparedOperator<'_>,
+    operator_workspace: &mut B::OperatorWorkspace,
+    operator: &dyn LinearOperator,
     factorization: &ArnoldiFactorization,
     shifts: &[Complex64],
     target_steps: usize,
@@ -236,8 +237,12 @@ fn implicit_restart_and_extend<B: Backend>(
     let residual_coupling = Complex64::new(beta, 0.0) * rotation[[m - 1, k - 1]];
 
     let mut residual = rotated_block.column(k).to_owned();
-    residual *= h_coupling;
-    residual.scaled_add(residual_coupling, &factorization.basis.column(m));
+    backend.scale_vector_in_place(&mut residual, h_coupling);
+    backend.add_scaled_vector_in_place(
+        &mut residual,
+        residual_coupling,
+        &factorization.basis.column(m).to_owned(),
+    );
 
     let residual_reference_norm = (h_coupling.norm_sqr() + residual_coupling.norm_sqr()).sqrt();
     let mut h_column_correction = vec![Complex64::default(); k];
@@ -274,6 +279,7 @@ fn implicit_restart_and_extend<B: Backend>(
 
     continue_arnoldi(
         backend,
+        operator_workspace,
         operator,
         continued_basis,
         restarted_hessenberg,

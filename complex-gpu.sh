@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=gpu
 #SBATCH --output=slurm-%x.out
 #SBATCH --error=slurm-%x.err
@@ -81,31 +81,34 @@ echo "========================================"
         --nev 8 \
         --ncv 200 \
         --max-restarts=10000 \
-        --tol=1e-16 \
+        --tol=1e-12 \
+        --seed 234 \
         --target largest-magnitude \
+        --ritz-inflation=1.0 \
         --output "${REPORT_FILE}"
 
 
-for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
-    JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-    REPORT_FILE="gpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
+# for RITZ_INFLATION in 1.0 1.02 1.05 1.08 1.1 1.15; do
+#     JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
+#     REPORT_FILE="gpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
 
-    echo "========================================"
-    echo "Running with ritz-inflation=${RITZ_INFLATION}"
-    echo "Output: ${REPORT_FILE}"
-    echo "========================================"
+#     echo "========================================"
+#     echo "Running with ritz-inflation=${RITZ_INFLATION}"
+#     echo "Output: ${REPORT_FILE}"
+#     echo "========================================"
 
-    ./target/release/complex-iram \
-        --backend magma \
-        --matrix-file matrices/quantum.mtx \
-        --nev 8 \
-        --ncv 200 \
-        --max-restarts=10000 \
-        --tol=1e-16 \
-        --ritz-inflation="${RITZ_INFLATION}" \
-        --target largest-magnitude \
-        --output "${REPORT_FILE}"
+#     ./target/release/complex-iram \
+#         --backend magma \
+#         --matrix-file matrices/quantum.mtx \
+#         --nev 4 \
+#         --ncv 200 \
+#         --max-restarts=10000 \
+#         --tol=1e-12 \
+#         --seed 234 \
+#         --target largest-magnitude \
+#         --ritz-inflation="${RITZ_INFLATION}" \
+#         --output "${REPORT_FILE}"
 
-done
+# done
 
 echo "End date: $(date)"

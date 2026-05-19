@@ -4,7 +4,8 @@ use num_complex::Complex64;
 
 use crate::backend::Backend;
 use crate::error::IramError;
-use crate::linalg::ops::normalize;
+
+use crate::operator::LinearOperator;
 
 /// Ответ процесса
 #[derive(Debug, Clone)]
@@ -34,22 +35,23 @@ impl ArnoldiFactorization {
 /// Вход в процесс Арнольди, первый прогон при инициализации пространства Крылова.
 pub fn run_arnoldi<B: Backend>(
     backend: &mut B,
-    operator: &B::PreparedOperator<'_>,
+    operator_workspace: &mut B::OperatorWorkspace,
+    operator: &dyn LinearOperator,
     start_vector: &Array1<Complex64>,
     steps: usize,
     breakdown_tol: f64,
     matvec_count: &mut usize,
 ) -> Result<ArnoldiFactorization, IramError> {
     let mut normalized_start = start_vector.clone();
-    normalize(&mut normalized_start, "Arnoldi start vector")?;
+    backend.normalize_vector(&mut normalized_start, "Arnoldi start vector")?;
 
-    let dimension = backend.prepared_operator_dimension(operator);
-    let mut basis = Array2::zeros((dimension, steps + 1).f());
+    let mut basis = Array2::zeros((operator.dimension(), steps + 1).f());
     basis.column_mut(0).assign(&normalized_start);
     let hessenberg = Array2::zeros((steps + 1, steps));
 
     continue_arnoldi(
         backend,
+        operator_workspace,
         operator,
         basis,
         hessenberg,
@@ -67,7 +69,8 @@ pub fn run_arnoldi<B: Backend>(
 /// синхронизировать добавленный базисный вектор.
 pub fn continue_arnoldi<B: Backend>(
     backend: &mut B,
-    operator: &B::PreparedOperator<'_>,
+    operator_workspace: &mut B::OperatorWorkspace,
+    operator: &dyn LinearOperator,
     mut basis: Array2<Complex64>,
     mut hessenberg: Array2<Complex64>,
     start_step: usize,
@@ -93,11 +96,10 @@ pub fn continue_arnoldi<B: Backend>(
         )));
     }
 
-    let dimension = backend.prepared_operator_dimension(operator);
-    if basis.nrows() != dimension {
+    if basis.nrows() != operator.dimension() {
         return Err(IramError::InvalidConfig(format!(
             "Arnoldi basis row count must equal operator dimension {}, got {}",
-            dimension,
+            operator.dimension(),
             basis.nrows(),
         )));
     }
@@ -105,18 +107,20 @@ pub fn continue_arnoldi<B: Backend>(
     let mut performed_steps = start_step;
     let mut happy_breakdown = false;
 
-    let mut workspace = backend.create_arnoldi_workspace(&basis, dimension)?;
+    let mut workspace = backend.create_arnoldi_workspace(&basis, operator.dimension())?;
     let mut h_column = vec![Complex64::default(); target_steps];
-    let mut candidate = Array1::zeros(dimension);
+    let mut candidate = Array1::zeros(operator.dimension());
 
     for step in start_step..target_steps {
-        let candidate_old = backend.apply_operator_to_arnoldi_column(
-            operator,
+        backend.apply_operator_to_basis_vector(
+            operator_workspace,
             &mut workspace,
+            operator,
             &basis,
             step,
             &mut candidate,
         )?;
+        let candidate_old = backend.vector_norm2(&candidate);
         *matvec_count += 1;
 
         h_column[..=step].fill(Complex64::ZERO);
@@ -175,9 +179,9 @@ mod tests {
         ]);
         let mut matvec_count = 0;
         let mut backend = LapackBackend::new();
+        let mut operator_workspace = backend.prepare_operator(&operator).unwrap();
 
-        let prepared = backend.prepare_operator(&operator).unwrap();
-        let result = run_arnoldi(&mut backend, &prepared, &start, 3, 1.0e-12, &mut matvec_count)
+        let result = run_arnoldi(&mut backend, &mut operator_workspace, &operator, &start, 3, 1.0e-12, &mut matvec_count)
             .expect("identity Arnoldi should not fail");
 
         assert_eq!(result.performed_steps, 1);
@@ -197,11 +201,12 @@ mod tests {
         ]);
         let mut matvec_count = 0;
         let mut backend = LapackBackend::new();
+        let mut operator_workspace = backend.prepare_operator(&operator).unwrap();
 
-        let prepared = backend.prepare_operator(&operator).unwrap();
         let factorization = run_arnoldi(
             &mut backend,
-            &prepared,
+            &mut operator_workspace,
+            &operator,
             &start,
             3,
             1.0e-12,

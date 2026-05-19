@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder};
 use num_complex::Complex64;
 use std::ffi::c_void;
-use std::os::raw::{c_char, c_int, c_longlong};
+use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::sync::Once;
 
@@ -36,37 +36,36 @@ pub struct SchurOutput {
 pub enum SchurError {
     NotSquare,
     BadIloIhi,
-    MagmaIllegalArgument(MagmaInt),
-    NoConvergence(MagmaInt),
-    IndexOverflow { context: &'static str, value: usize },
+    MagmaIllegalArgument(i32),
+    NoConvergence(i32),
     DimensionMismatch,
     InvalidEigenIndex(usize),
 }
 
+#[derive(Debug)]
+pub struct CusparseError(pub i32);
+
 //type MagmaQueue = *mut c_void;
 
-const MAGMA_NO_TRANS: MagmaInt = 111;
-const MAGMA_CONJ_TRANS: MagmaInt = 113;
-const MAGMA_NO_VEC: MagmaInt = 301;
-const MAGMA_VEC: MagmaInt = 302;
-const MAGMA_RIGHT: MagmaInt = 142;
-const MAGMA_BACKTRANS_VEC: MagmaInt = 307;
-const MAGMA_SUCCESS: MagmaInt = 0;
+const MAGMA_NO_TRANS: c_int = 111;
+const MAGMA_CONJ_TRANS: c_int = 113;
+const MAGMA_NO_VEC: c_int = 301;
+const MAGMA_VEC: c_int = 302;
+const MAGMA_RIGHT: c_int = 142;
+const MAGMA_BACKTRANS_VEC: c_int = 307;
+const MAGMA_SUCCESS: c_int = 0;
 const MAGMA_FUNC: *const c_char = b"rust\0".as_ptr().cast();
 const MAGMA_FILE: *const c_char = b"src/linalg/magma.rs\0".as_ptr().cast();
 
 static MAGMA_INIT: Once = Once::new();
 
-// MAGMA normally uses C int for magma_int_t/magma_index_t.
-// Enable `--features magma-ilp64` only when the linked MAGMA build uses
-// 64-bit magma_int_t/magma_index_t; otherwise the FFI ABI will not match.
-#[cfg(feature = "magma-ilp64")]
-type MagmaInt = c_longlong;
-#[cfg(not(feature = "magma-ilp64"))]
+// MAGMA normally uses C int for magma_int_t unless built with ILP64.
 type MagmaInt = c_int;
-
-// MAGMA device ids remain C int even for ILP64 integer builds.
 type MagmaDevice = c_int;
+type CusparseStatus = c_int;
+type CusparseHandle = *mut c_void;
+
+const CUSPARSE_SUCCESS: CusparseStatus = 0;
 
 // Opaque MAGMA queue handle.
 #[repr(C)]
@@ -75,106 +74,6 @@ pub struct MagmaQueueOpaque {
 }
 
 type MagmaQueue = *mut MagmaQueueOpaque;
-
-
-const MAGMA_CSR: MagmaInt = 611;
-const MAGMA_DENSE: MagmaInt = 614;
-const MAGMA_DEV: MagmaInt = 572;
-const MAGMA_GENERAL: MagmaInt = 581;
-
-/// Rust layout for MAGMA sparse `magma_z_matrix`.
-///
-/// The pointer fields correspond to the pointer-sized union members in the C
-/// definition. This wrapper is used only for device CSR matrices and device
-/// dense vectors/matrices passed to `magma_z_spmv`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MagmaZMatrix {
-    storage_type: MagmaInt,
-    memory_location: MagmaInt,
-    sym: MagmaInt,
-    diagorder_type: MagmaInt,
-    fill_mode: MagmaInt,
-    num_rows: MagmaInt,
-    num_cols: MagmaInt,
-    nnz: MagmaInt,
-    max_nnz_row: MagmaInt,
-    diameter: MagmaInt,
-    val: *mut Complex64,
-    diag: *mut Complex64,
-    row: *mut MagmaIndex,
-    rowidx: *mut MagmaIndex,
-    col: *mut MagmaIndex,
-    list: *mut MagmaIndex,
-    blockinfo: *mut MagmaIndex,
-    blocksize: MagmaInt,
-    numblocks: MagmaInt,
-    alignment: MagmaInt,
-    major: MagmaInt,
-    ld: MagmaInt,
-}
-
-impl MagmaZMatrix {
-    fn zeroed() -> Self {
-        Self {
-            storage_type: 0,
-            memory_location: 0,
-            sym: MAGMA_GENERAL,
-            diagorder_type: 0,
-            fill_mode: 0,
-            num_rows: 0,
-            num_cols: 0,
-            nnz: 0,
-            max_nnz_row: 0,
-            diameter: 0,
-            val: ptr::null_mut(),
-            diag: ptr::null_mut(),
-            row: ptr::null_mut(),
-            rowidx: ptr::null_mut(),
-            col: ptr::null_mut(),
-            list: ptr::null_mut(),
-            blockinfo: ptr::null_mut(),
-            blocksize: 0,
-            numblocks: 0,
-            alignment: 0,
-            major: 0,
-            ld: 0,
-        }
-    }
-
-    fn dense_device_vector(len: usize, values: *mut Complex64) -> Self {
-        let mut matrix = Self::zeroed();
-        matrix.storage_type = MAGMA_DENSE;
-        matrix.memory_location = MAGMA_DEV;
-        matrix.num_rows = expect_magma_int(len, "dense vector length");
-        matrix.num_cols = 1;
-        matrix.nnz = expect_magma_int(len, "dense vector nnz");
-        matrix.val = values;
-        matrix.ld = expect_magma_int(len.max(1), "dense vector ld");
-        matrix
-    }
-}
-
-#[cfg(feature = "magma-ilp64")]
-type MagmaIndex = c_longlong;
-#[cfg(not(feature = "magma-ilp64"))]
-type MagmaIndex = c_int;
-
-#[inline]
-fn usize_to_magma_int(value: usize, context: &'static str) -> Result<MagmaInt, SchurError> {
-    MagmaInt::try_from(value).map_err(|_| SchurError::IndexOverflow { context, value })
-}
-
-#[inline]
-fn usize_to_magma_index(value: usize, context: &'static str) -> Result<MagmaIndex, SchurError> {
-    MagmaIndex::try_from(value).map_err(|_| SchurError::IndexOverflow { context, value })
-}
-
-#[inline]
-fn expect_magma_int(value: usize, context: &'static str) -> MagmaInt {
-    usize_to_magma_int(value, context)
-        .unwrap_or_else(|_| panic!("{context}={value} does not fit into MAGMA integer type"))
-}
 
 unsafe extern "C" {
     fn magma_init() -> MagmaInt;
@@ -344,34 +243,30 @@ unsafe extern "C" {
         info: *mut MagmaInt,
     ) -> MagmaInt;
 
+    fn cusparseCreate(handle: *mut CusparseHandle) -> CusparseStatus;
+    fn cusparseDestroy(handle: CusparseHandle) -> CusparseStatus;
 
-    fn magma_z_spmv(
-        alpha: Complex64,
-        a: MagmaZMatrix,
-        x: MagmaZMatrix,
-        beta: Complex64,
-        y: MagmaZMatrix,
-        queue: MagmaQueue,
-    ) -> MagmaInt;
+    // CUDA 12.x no longer exports the deprecated legacy `cusparseZcsrmv`
+    // symbol.  The C++/CUDA translation unit implements this wrapper with
+    // the current generic cuSPARSE API (`cusparseCreateCsr` + `cusparseSpMV`).
+    fn complex_iram_cusparse_zcsrmv(
+        handle: CusparseHandle,
+        dimension: c_int,
+        nnz: c_int,
+        csr_row_offsets: *const c_int,
+        csr_columns: *const c_int,
+        csr_values: *const Complex64,
+        x: *const Complex64,
+        y: *mut Complex64,
+    ) -> CusparseStatus;
 
-    fn magmablas_zrot(
-        n: MagmaInt,
-        dx: *mut Complex64,
-        incx: MagmaInt,
-        dy: *mut Complex64,
-        incy: MagmaInt,
-        c: f64,
-        s: Complex64,
-        queue: MagmaQueue,
-    );
-
-    fn zlartg_(
-        f: *const Complex64,
-        g: *const Complex64,
-        cs: *mut f64,
-        sn: *mut Complex64,
-        r: *mut Complex64,
-    );
+    fn complex_iram_shifted_qr_filter_cuda(
+        n: c_int,
+        h_row_major: *mut Complex64,
+        q_row_major: *mut Complex64,
+        shifts: *const Complex64,
+        shift_count: c_int,
+    ) -> c_int;
 }
 
 const MAGMA_COMPLEX64_SIZE: MagmaInt = std::mem::size_of::<Complex64>() as MagmaInt;
@@ -538,46 +433,34 @@ impl Drop for DeviceBuffer {
     }
 }
 
-
-struct DeviceIndexBuffer {
-    ptr: *mut MagmaIndex,
-    bytes: usize,
+struct DeviceI32Buffer {
+    ptr: *mut c_int,
     len: usize,
+    bytes: usize,
 }
 
-impl DeviceIndexBuffer {
-    fn from_usize_slice(session: &MagmaSession, values: &[usize], context: &'static str) -> Result<Self, SchurError> {
-        let converted = values
-            .iter()
-            .map(|&value| usize_to_magma_index(value, context))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::from_index_slice(session, &converted, context))
-    }
-
-    fn from_index_slice(session: &MagmaSession, values: &[MagmaIndex], _context: &'static str) -> Self {
+impl DeviceI32Buffer {
+    fn from_slice(values: &[c_int]) -> Self {
         ensure_magma_initialized();
-        let len = values.len();
-        let bytes = len
-            .checked_mul(std::mem::size_of::<MagmaIndex>())
-            .expect("MAGMA index allocation size overflow");
-        let mut raw = ptr::null_mut();
-        let status = unsafe { magma_malloc(&mut raw, bytes) };
-        assert_eq!(status, MAGMA_SUCCESS, "magma_malloc for index buffer failed with status {status}");
-        let buffer = Self {
-            ptr: raw.cast::<MagmaIndex>(),
-            bytes,
-            len,
-        };
+        let mut ptr = ptr::null_mut();
+        let bytes = values
+            .len()
+            .checked_mul(std::mem::size_of::<c_int>())
+            .expect("MAGMA i32 allocation size overflow");
+        let status = unsafe { magma_malloc(&mut ptr, bytes) };
+        assert_eq!(status, MAGMA_SUCCESS, "magma_malloc failed with status {status}");
+        memory::record_device_allocation(bytes);
+
         if !values.is_empty() {
             unsafe {
                 magma_setvector_internal(
-                    expect_magma_int(len, "index buffer length"),
-                    expect_magma_int(std::mem::size_of::<MagmaIndex>(), "index element size"),
+                    values.len() as MagmaInt,
+                    std::mem::size_of::<c_int>() as MagmaInt,
                     values.as_ptr().cast::<c_void>(),
                     1,
-                    buffer.ptr.cast::<c_void>(),
+                    ptr,
                     1,
-                    session.queue.raw,
+                    MagmaSession::new().queue.raw,
                     MAGMA_FUNC,
                     MAGMA_FILE,
                     line!() as c_int,
@@ -585,17 +468,43 @@ impl DeviceIndexBuffer {
             }
             memory::record_host_to_device_copy(bytes);
         }
-        memory::record_device_allocation(bytes);
-        buffer
+
+        Self {
+            ptr: ptr.cast::<c_int>(),
+            len: values.len(),
+            bytes,
+        }
     }
 }
 
-impl Drop for DeviceIndexBuffer {
+impl Drop for DeviceI32Buffer {
     fn drop(&mut self) {
         unsafe {
             magma_free_internal(self.ptr.cast::<c_void>(), MAGMA_FUNC, MAGMA_FILE, line!() as c_int);
         }
         memory::record_device_deallocation(self.bytes);
+    }
+}
+
+struct CusparseContext {
+    raw: CusparseHandle,
+}
+
+impl CusparseContext {
+    fn new() -> Self {
+        let mut raw = ptr::null_mut();
+        let status = unsafe { cusparseCreate(&mut raw) };
+        assert_eq!(status, CUSPARSE_SUCCESS, "cusparseCreate failed with status {status}");
+        assert!(!raw.is_null(), "cusparseCreate returned a null handle");
+        Self { raw }
+    }
+}
+
+impl Drop for CusparseContext {
+    fn drop(&mut self) {
+        unsafe {
+            cusparseDestroy(self.raw);
+        }
     }
 }
 
@@ -653,14 +562,14 @@ fn identity_fortran_vec(n: usize) -> Vec<Complex64> {
     z
 }
 
-fn magma_trans(trans: ZgemmTranspose) -> MagmaInt {
+fn magma_trans(trans: ZgemmTranspose) -> c_int {
     match trans {
         ZgemmTranspose::None => MAGMA_NO_TRANS,
         ZgemmTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
     }
 }
 
-fn magma_trans_from_zgemv(trans: ZgemvTranspose) -> MagmaInt {
+fn magma_trans_from_zgemv(trans: ZgemvTranspose) -> c_int {
     match trans {
         ZgemvTranspose::None => MAGMA_NO_TRANS,
         ZgemvTranspose::ConjugateTranspose => MAGMA_CONJ_TRANS,
@@ -680,11 +589,15 @@ fn transposed_shape(rows: usize, columns: usize, trans: ZgemmTranspose) -> (usiz
 /// for every small operation.
 pub struct MagmaSession {
     queue: Queue,
+    cusparse: CusparseContext,
 }
 
 impl MagmaSession {
     pub fn new() -> Self {
-        Self { queue: Queue::new() }
+        Self {
+            queue: Queue::new(),
+            cusparse: CusparseContext::new(),
+        }
     }
 }
 
@@ -740,7 +653,7 @@ impl DeviceVector {
         }
         unsafe {
             magma_zsetvector(
-                expect_magma_int(values.len(), "vector upload length"),
+                values.len() as c_int,
                 values.as_ptr(),
                 1,
                 self.buffer.ptr,
@@ -759,7 +672,7 @@ impl DeviceVector {
         }
         unsafe {
             magma_zgetvector(
-                expect_magma_int(values.len(), "vector download length"),
+                values.len() as c_int,
                 self.buffer.ptr,
                 1,
                 values.as_mut_ptr(),
@@ -771,35 +684,13 @@ impl DeviceVector {
     }
 
     #[inline]
-    fn ptr(&self) -> *const Complex64 {
+    pub(crate) fn ptr(&self) -> *const Complex64 {
         self.buffer.ptr
     }
 
     #[inline]
-    fn mut_ptr(&mut self) -> *mut Complex64 {
+    pub(crate) fn mut_ptr(&mut self) -> *mut Complex64 {
         self.buffer.ptr
-    }
-
-    #[inline]
-    pub(crate) fn ptr_at(&self, offset: usize) -> *const Complex64 {
-        assert!(offset <= self.len);
-        unsafe { self.buffer.ptr.add(offset) }
-    }
-
-    #[inline]
-    pub(crate) fn mut_ptr_at(&mut self, offset: usize) -> *mut Complex64 {
-        assert!(offset <= self.len);
-        unsafe { self.buffer.ptr.add(offset) }
-    }
-
-    #[inline]
-    pub(crate) fn as_magma_dense(&self) -> MagmaZMatrix {
-        MagmaZMatrix::dense_device_vector(self.len, self.buffer.ptr)
-    }
-
-    #[inline]
-    pub(crate) fn as_magma_dense_mut(&mut self) -> MagmaZMatrix {
-        MagmaZMatrix::dense_device_vector(self.len, self.buffer.ptr)
     }
 }
 
@@ -808,7 +699,7 @@ pub struct DeviceMatrix {
     buffer: DeviceBuffer,
     rows: usize,
     columns: usize,
-    lda: MagmaInt,
+    lda: c_int,
 }
 
 impl DeviceMatrix {
@@ -817,7 +708,7 @@ impl DeviceMatrix {
             buffer: DeviceBuffer::new(rows.saturating_mul(columns)),
             rows,
             columns,
-            lda: expect_magma_int(rows.max(1), "device matrix lda"),
+            lda: rows.max(1) as c_int,
         }
     }
 
@@ -831,10 +722,10 @@ impl DeviceMatrix {
         if rows != 0 && columns != 0 {
             unsafe {
                 magma_zsetmatrix(
-                    expect_magma_int(rows, "matrix upload rows"),
-                    expect_magma_int(columns, "matrix upload columns"),
+                    rows as c_int,
+                    columns as c_int,
                     memory.as_ptr(),
-                    expect_magma_int(rows.max(1), "matrix upload lda"),
+                    rows.max(1) as c_int,
                     device.buffer.ptr,
                     device.lda,
                     session.queue.raw,
@@ -856,12 +747,12 @@ impl DeviceMatrix {
         }
         unsafe {
             magma_zgetmatrix(
-                expect_magma_int(self.rows, "zgemv rows"),
-                expect_magma_int(self.columns, "zgemv columns"),
+                self.rows as c_int,
+                self.columns as c_int,
                 self.buffer.ptr,
                 self.lda,
                 output.as_mut_ptr(),
-                expect_magma_int(self.rows.max(1), "matrix download lda"),
+                self.rows.max(1) as c_int,
                 session.queue.raw,
             );
         }
@@ -894,8 +785,8 @@ impl DeviceMatrix {
         unsafe {
             magma_zgemv(
                 magma_trans_from_zgemv(trans),
-                expect_magma_int(self.rows, "zgemv rows"),
-                expect_magma_int(self.columns, "zgemv columns"),
+                self.rows as c_int,
+                self.columns as c_int,
                 alpha,
                 self.buffer.ptr,
                 self.lda,
@@ -916,31 +807,9 @@ impl DeviceMatrix {
         self.columns
     }
 
-
     pub(crate) fn column_ptr(&self, column: usize) -> *const Complex64 {
         assert!(column < self.columns);
         unsafe { self.buffer.ptr.add(column * self.lda as usize) }
-    }
-
-    pub(crate) fn column_mut_ptr(&mut self, column: usize) -> *mut Complex64 {
-        assert!(column < self.columns);
-        unsafe { self.buffer.ptr.add(column * self.lda as usize) }
-    }
-
-    pub(crate) fn column_as_dense_vector(&self, column: usize) -> MagmaZMatrix {
-        MagmaZMatrix::dense_device_vector(self.rows, self.column_ptr(column).cast_mut())
-    }
-
-    fn element_mut_ptr(&self, row: usize, column: usize) -> *mut Complex64 {
-        assert!(row < self.rows);
-        assert!(column < self.columns);
-        unsafe { self.buffer.ptr.add(row + column * self.lda as usize) }
-    }
-
-    fn element_ptr(&self, row: usize, column: usize) -> *const Complex64 {
-        assert!(row < self.rows);
-        assert!(column < self.columns);
-        unsafe { self.buffer.ptr.add(row + column * self.lda as usize) }
     }
 
     /// Uploads one host vector into a column of this device matrix.
@@ -964,7 +833,7 @@ impl DeviceMatrix {
         unsafe {
             let destination = self.buffer.ptr.add(column * self.lda as usize);
             magma_zsetvector(
-                expect_magma_int(self.rows, "column upload rows"),
+                self.rows as c_int,
                 values.as_ptr(),
                 1,
                 destination,
@@ -1008,8 +877,8 @@ impl DeviceMatrix {
         unsafe {
             magma_zgemv(
                 magma_trans_from_zgemv(trans),
-                expect_magma_int(self.rows, "zgemv leading rows"),
-                expect_magma_int(columns, "zgemv leading columns"),
+                self.rows as c_int,
+                columns as c_int,
                 alpha,
                 self.buffer.ptr,
                 self.lda,
@@ -1024,6 +893,90 @@ impl DeviceMatrix {
     }
 
 }
+
+
+/// Device-side CSR matrix used by MAGMA backend for cuSPARSE matvec.
+pub struct DeviceCsrMatrix {
+    dimension: usize,
+    nnz: usize,
+    d_row_offsets: DeviceI32Buffer,
+    d_columns: DeviceI32Buffer,
+    d_values: DeviceBuffer,
+}
+
+impl DeviceCsrMatrix {
+    pub fn from_csr(
+        session: &MagmaSession,
+        dimension: usize,
+        row_offsets: &[usize],
+        columns: &[usize],
+        values: &[Complex64],
+    ) -> Result<Self, CusparseError> {
+        assert_eq!(row_offsets.len(), dimension + 1);
+        assert_eq!(columns.len(), values.len());
+
+        let row_offsets_i32 = row_offsets
+            .iter()
+            .map(|&value| c_int::try_from(value).expect("CSR row offset exceeds c_int"))
+            .collect::<Vec<_>>();
+        let columns_i32 = columns
+            .iter()
+            .map(|&value| c_int::try_from(value).expect("CSR column index exceeds c_int"))
+            .collect::<Vec<_>>();
+
+        let d_row_offsets = DeviceI32Buffer::from_slice(&row_offsets_i32);
+        let d_columns = DeviceI32Buffer::from_slice(&columns_i32);
+        let mut d_values = DeviceBuffer::new(values.len().max(1));
+        if !values.is_empty() {
+            unsafe {
+                magma_zsetvector(
+                    values.len() as c_int,
+                    values.as_ptr(),
+                    1,
+                    d_values.ptr,
+                    1,
+                    session.queue.raw,
+                );
+            }
+            memory::record_host_to_device_copy(values.len() * std::mem::size_of::<Complex64>());
+        }
+
+        Ok(Self {
+            dimension,
+            nnz: values.len(),
+            d_row_offsets,
+            d_columns,
+            d_values,
+        })
+    }
+
+    pub fn spmv_raw(
+        &self,
+        session: &MagmaSession,
+        x: *const Complex64,
+        y: *mut Complex64,
+    ) -> Result<(), CusparseError> {
+        let status = unsafe {
+            complex_iram_cusparse_zcsrmv(
+                session.cusparse.raw,
+                self.dimension as c_int,
+                self.nnz as c_int,
+                self.d_row_offsets.ptr,
+                self.d_columns.ptr,
+                self.d_values.ptr,
+                x,
+                y,
+            )
+        };
+
+        if status == CUSPARSE_SUCCESS {
+            Ok(())
+        } else {
+            Err(CusparseError(status))
+        }
+    }
+}
+
 
 #[inline]
 fn assert_column_major_contiguous(matrix: ArrayView2<'_, Complex64>, context: &str) {
@@ -1040,6 +993,132 @@ fn assert_column_major_contiguous(matrix: ArrayView2<'_, Complex64>, context: &s
     matrix
         .as_slice_memory_order()
         .expect("column-major matrix must be contiguous");
+}
+
+
+fn copy_ndarray_to_row_major(matrix: &Array2<Complex64>, output: &mut [Complex64], n: usize) {
+    debug_assert_eq!(output.len(), n * n);
+    for row in 0..n {
+        for column in 0..n {
+            output[row * n + column] = matrix[(row, column)];
+        }
+    }
+}
+
+fn copy_row_major_to_fortran(input: &[Complex64], output: &mut [Complex64], n: usize) {
+    debug_assert_eq!(input.len(), n * n);
+    debug_assert_eq!(output.len(), n * n);
+    for column in 0..n {
+        for row in 0..n {
+            output[row + column * n] = input[row * n + column];
+        }
+    }
+}
+
+fn fill_identity_row_major(matrix: &mut [Complex64], n: usize) {
+    matrix.fill(Complex64::ZERO);
+    for i in 0..n {
+        matrix[i * n + i] = Complex64::new(1.0, 0.0);
+    }
+}
+
+pub fn shifted_qr_filter_with_session(
+    session: &MagmaSession,
+    hessenberg: &Array2<Complex64>,
+    shifts: &[Complex64],
+) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
+    let (rows, columns) = hessenberg.dim();
+    if rows != columns {
+        return Err("H must be square".to_string());
+    }
+    let n = rows;
+    let len = n.saturating_mul(n);
+
+    let mut h_row_major = vec![Complex64::ZERO; len];
+    let mut q_row_major = vec![Complex64::ZERO; len];
+    let mut h_fortran = vec![Complex64::ZERO; len];
+    let mut q_fortran = vec![Complex64::ZERO; len];
+    copy_ndarray_to_row_major(hessenberg, &mut h_row_major, n);
+    fill_identity_row_major(&mut q_row_major, n);
+
+    if n > 0 {
+        let mut d_h = DeviceBuffer::new(len);
+        let mut d_q = DeviceBuffer::new(len);
+        let mut d_shifts = DeviceBuffer::new(shifts.len().max(1));
+
+        unsafe {
+            magma_zsetvector(
+                len as c_int,
+                h_row_major.as_ptr(),
+                1,
+                d_h.ptr,
+                1,
+                session.queue.raw,
+            );
+            magma_zsetvector(
+                len as c_int,
+                q_row_major.as_ptr(),
+                1,
+                d_q.ptr,
+                1,
+                session.queue.raw,
+            );
+            if !shifts.is_empty() {
+                magma_zsetvector(
+                    shifts.len() as c_int,
+                    shifts.as_ptr(),
+                    1,
+                    d_shifts.ptr,
+                    1,
+                    session.queue.raw,
+                );
+            }
+        }
+        memory::record_host_to_device_copy((2 * len + shifts.len()) * std::mem::size_of::<Complex64>());
+
+        let status = unsafe {
+            complex_iram_shifted_qr_filter_cuda(
+                n as c_int,
+                d_h.ptr,
+                d_q.ptr,
+                d_shifts.ptr,
+                shifts.len() as c_int,
+            )
+        };
+        if status != 0 {
+            return Err(format!("CUDA shifted QR kernel failed with status {status}"));
+        }
+
+        unsafe {
+            magma_zgetvector(
+                len as c_int,
+                d_h.ptr,
+                1,
+                h_row_major.as_mut_ptr(),
+                1,
+                session.queue.raw,
+            );
+            magma_zgetvector(
+                len as c_int,
+                d_q.ptr,
+                1,
+                q_row_major.as_mut_ptr(),
+                1,
+                session.queue.raw,
+            );
+        }
+        memory::record_device_to_host_copy(2 * len * std::mem::size_of::<Complex64>());
+    }
+
+    copy_row_major_to_fortran(&q_row_major, &mut q_fortran, n);
+    copy_row_major_to_fortran(&h_row_major, &mut h_fortran, n);
+
+    let q = Array2::from_shape_vec((n, n).f(), q_fortran)
+        .expect("invalid Fortran rotation buffer shape");
+    let h = Array2::from_shape_vec((n, n).f(), h_fortran)
+        .expect("invalid Fortran Hessenberg buffer shape");
+
+    Ok((q, h))
 }
 
 pub fn zgemm_with_session(
@@ -1071,9 +1150,9 @@ pub fn zgemm_with_session(
         magma_zgemm(
             magma_trans(trans_a),
             magma_trans(trans_b),
-            expect_magma_int(a_effective_rows, "zgemm m"),
-            expect_magma_int(b_effective_columns, "zgemm n"),
-            expect_magma_int(a_effective_columns, "zgemm k"),
+            a_effective_rows as c_int,
+            b_effective_columns as c_int,
+            a_effective_columns as c_int,
             Complex64::new(1.0, 0.0),
             d_a.buffer.ptr,
             d_a.lda,
@@ -1179,14 +1258,14 @@ fn magma_zgeev_right(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
     }
 
     ensure_magma_initialized();
-    let n_i = usize_to_magma_int(n, "zgeev dimension")?;
+    let n_i = n as c_int;
     let mut a_col = to_fortran_vec(a);
     let mut w = vec![zero(); n];
     let mut vl_dummy = [zero(); 1];
     let mut z = vec![zero(); n * n];
     let mut rwork = vec![0.0; 2 * n];
     let mut work_query = [zero(); 1];
-    let mut info: MagmaInt = 0;
+    let mut info = 0_i32;
 
     unsafe {
         magma_zgeev(
@@ -1214,10 +1293,9 @@ fn magma_zgeev_right(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
         return Err(SchurError::NoConvergence(info));
     }
 
-    let lwork = (work_query[0].re as usize).max(2 * n).max(1);
-    let lwork_i = usize_to_magma_int(lwork, "zgeev lwork")?;
-    let mut work = vec![zero(); lwork];
-    let mut info: MagmaInt = 0;
+    let lwork = (work_query[0].re as i32).max(2 * n_i).max(1);
+    let mut work = vec![zero(); lwork as usize];
+    let mut info = 0_i32;
 
     unsafe {
         magma_zgeev(
@@ -1232,7 +1310,7 @@ fn magma_zgeev_right(a: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
             z.as_mut_ptr(),
             n_i,
             work.as_mut_ptr(),
-            lwork_i,
+            lwork,
             rwork.as_mut_ptr(),
             &mut info,
         );
@@ -1314,19 +1392,18 @@ pub fn ztrevc3_right_backtrans_all(
 
     ensure_magma_initialized();
 
-    let n_i = usize_to_magma_int(dim, "ztrevc dimension")?;
+    let n_i = dim as c_int;
     let mut t_work = t.to_vec();
     let mut right_vectors = q.to_vec();
     let mut left_dummy = vec![zero(); 1];
-    let mut mout: MagmaInt = 0;
+    let mut mout = 0_i32;
 
     // MAGMA requires at least 2*n workspace. A larger workspace enables the
     // blocked Level-3 path in ztrevc3_mt.
-    let lwork = ((1 + 2 * 64) * dim).max(2 * dim).max(1);
-    let lwork_i = usize_to_magma_int(lwork, "ztrevc lwork")?;
-    let mut work = vec![zero(); lwork];
+    let lwork = ((1 + 2 * 64) * dim).max(2 * dim).max(1) as c_int;
+    let mut work = vec![zero(); lwork as usize];
     let mut rwork = vec![0.0; dim.max(1)];
-    let mut info: MagmaInt = 0;
+    let mut info = 0_i32;
 
     unsafe {
         magma_ztrevc3_mt(
@@ -1343,7 +1420,7 @@ pub fn ztrevc3_right_backtrans_all(
             n_i,
             &mut mout,
             work.as_mut_ptr(),
-            lwork_i,
+            lwork,
             rwork.as_mut_ptr(),
             &mut info,
         );
@@ -1363,15 +1440,15 @@ pub fn ztrevc3_right_backtrans_all(
 }
 
 fn magma_zgeqrf_lwork(
-    m: MagmaInt,
-    n: MagmaInt,
+    m: c_int,
+    n: c_int,
     a: &mut [Complex64],
-    lda: MagmaInt,
+    lda: c_int,
     tau: &mut [Complex64],
-) -> Result<usize, String> {
+) -> Result<c_int, String> {
     ensure_magma_initialized();
     let mut work_query = [zero(); 1];
-    let mut info: MagmaInt = 0;
+    let mut info = 0;
     unsafe {
         magma_zgeqrf(
             m,
@@ -1388,18 +1465,18 @@ fn magma_zgeqrf_lwork(
         return Err(format!("magma_zgeqrf workspace query failed, info = {info}"));
     }
 
-    Ok((work_query[0].re as usize).max(usize::try_from(n).unwrap_or(1)).max(1))
+    Ok((work_query[0].re as c_int).max(n).max(1))
 }
 
 fn magma_zgeqrf_factor(
-    m: MagmaInt,
-    n: MagmaInt,
+    m: c_int,
+    n: c_int,
     a: &mut [Complex64],
-    lda: MagmaInt,
+    lda: c_int,
     tau: &mut [Complex64],
     work: &mut [Complex64],
 ) -> Result<(), String> {
-    let mut info: MagmaInt = 0;
+    let mut info = 0;
     unsafe {
         magma_zgeqrf(
             m,
@@ -1408,7 +1485,7 @@ fn magma_zgeqrf_factor(
             lda,
             tau.as_mut_ptr(),
             work.as_mut_ptr(),
-            expect_magma_int(work.len(), "zgeqrf work length"),
+            work.len() as c_int,
             &mut info,
         );
     }
@@ -1632,347 +1709,27 @@ pub fn last_r_col_without_diag_from_zgeqrf(
     }
     mat.extend(z.iter().copied());
 
-    let m = expect_magma_int(nrows, "zgeqrf rows");
-    let n = expect_magma_int(ncols, "zgeqrf columns");
-    let lda = expect_magma_int(nrows.max(1), "zgeqrf lda");
+    let m = nrows as i32;
+    let n = ncols as i32;
+    let lda = m.max(1);
 
-    let min_mn = nrows.min(ncols);
-    let mut tau = vec![zero(); min_mn];
+    let min_mn = m.min(n);
+    let mut tau = vec![zero(); min_mn as usize];
 
     let lwork = magma_zgeqrf_lwork(m, n, &mut mat, lda, &mut tau)?;
     if lwork <= 0 {
         return Err(format!("magma_zgeqrf returned invalid lwork = {}", lwork));
     }
 
-    let mut work = vec![zero(); lwork];
+    let mut work = vec![zero(); lwork as usize];
     magma_zgeqrf_factor(m, n, &mut mat, lda, &mut tau, &mut work)?;
 
     // R хранится в верхнем треугольнике mat. Последний столбец имеет offset k * lda.
     // Без диагонального элемента берём строки 0..rlen, где rlen = min(k, nrows).
     let rlen = k.min(nrows);
-    let offset = k * nrows.max(1);
+    let offset = k * lda as usize;
 
     Ok(mat[offset..offset + rlen].to_vec())
-}
-
-/// Device-resident CSR matrix backed by MAGMA sparse metadata.
-pub struct DeviceCsrMatrix {
-    raw: MagmaZMatrix,
-    _row_offsets: DeviceIndexBuffer,
-    _column_indices: DeviceIndexBuffer,
-    _values: DeviceBuffer,
-    rows: usize,
-    columns: usize,
-    nnz: usize,
-}
-
-impl DeviceCsrMatrix {
-    pub fn from_csr(
-        session: &MagmaSession,
-        rows: usize,
-        columns: usize,
-        row_offsets: &[usize],
-        column_indices: &[usize],
-        values: &[Complex64],
-    ) -> Result<Self, SchurError> {
-        if row_offsets.len() != rows + 1 || column_indices.len() != values.len() {
-            return Err(SchurError::DimensionMismatch);
-        }
-
-        let max_nnz_row = row_offsets
-            .windows(2)
-            .map(|window| window[1] - window[0])
-            .max()
-            .unwrap_or(0);
-        let row_offsets = DeviceIndexBuffer::from_usize_slice(session, row_offsets, "CSR row offsets")?;
-        let column_indices = DeviceIndexBuffer::from_usize_slice(session, column_indices, "CSR column indices")?;
-        let mut values_buffer = DeviceBuffer::new(values.len());
-        if !values.is_empty() {
-            unsafe {
-                magma_zsetvector(
-                    usize_to_magma_int(values.len(), "CSR values length")?,
-                    values.as_ptr(),
-                    1,
-                    values_buffer.ptr,
-                    1,
-                    session.queue.raw,
-                );
-            }
-            memory::record_host_to_device_copy(values.len() * std::mem::size_of::<Complex64>());
-        }
-
-        let mut raw = MagmaZMatrix::zeroed();
-        raw.storage_type = MAGMA_CSR;
-        raw.memory_location = MAGMA_DEV;
-        raw.sym = MAGMA_GENERAL;
-        raw.num_rows = usize_to_magma_int(rows, "CSR rows")?;
-        raw.num_cols = usize_to_magma_int(columns, "CSR columns")?;
-        raw.nnz = usize_to_magma_int(values.len(), "CSR nnz")?;
-        raw.val = values_buffer.ptr;
-        raw.row = row_offsets.ptr;
-        raw.col = column_indices.ptr;
-
-        raw.max_nnz_row = usize_to_magma_int(max_nnz_row, "CSR max_nnz_row")?;
-
-        Ok(Self {
-            raw,
-            _row_offsets: row_offsets,
-            _column_indices: column_indices,
-            _values: values_buffer,
-            rows,
-            columns,
-            nnz: values.len(),
-        })
-    }
-
-    pub fn spmv_device_vector(
-        &self,
-        session: &MagmaSession,
-        x: MagmaZMatrix,
-        y: &mut DeviceVector,
-    ) -> Result<(), SchurError> {
-        if usize::try_from(x.num_rows).ok() != Some(self.columns) || y.len() != self.rows {
-            return Err(SchurError::DimensionMismatch);
-        }
-        let status = unsafe {
-            magma_z_spmv(
-                Complex64::new(1.0, 0.0),
-                self.raw,
-                x,
-                Complex64::ZERO,
-                y.as_magma_dense_mut(),
-                session.queue.raw,
-            )
-        };
-        if status != MAGMA_SUCCESS {
-            return Err(SchurError::MagmaIllegalArgument(status));
-        }
-        Ok(())
-    }
-
-    pub fn spmv_from_matrix_column(
-        &self,
-        session: &MagmaSession,
-        x_matrix: &DeviceMatrix,
-        column: usize,
-        y: &mut DeviceVector,
-    ) -> Result<(), SchurError> {
-        self.spmv_device_vector(session, x_matrix.column_as_dense_vector(column), y)
-    }
-}
-
-
-/// MAGMA-owned shifted QR entry point.
-///
-/// The implicit shifts are driven from Rust, while Givens row/column updates are
-/// applied to device-resident Hessenberg and rotation matrices via MAGMA BLAS
-/// `magmablas_zrot`. The only scalar host traffic is the two complex entries
-/// required to form each Givens rotation and the final result download.
-pub fn shifted_qr_filter_with_session(
-    session: &MagmaSession,
-    hessenberg: &Array2<Complex64>,
-    shifts: &[Complex64],
-) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
-    let (rows, columns) = hessenberg.dim();
-    if rows != columns {
-        return Err("H must be square".to_string());
-    }
-    let n = rows;
-    if n == 0 {
-        return Ok((
-            Array2::zeros((0, 0).f()),
-            Array2::zeros((0, 0).f()),
-        ));
-    }
-
-    let h_fortran = to_fortran_vec(hessenberg);
-    let h_host = from_fortran_vec(n, n, h_fortran);
-    let q_host = from_fortran_vec(n, n, identity_fortran_vec(n));
-    let mut d_h = DeviceMatrix::from_column_major(session, h_host.view());
-    let mut d_q = DeviceMatrix::from_column_major(session, q_host.view());
-
-    for (shift_index, &shift) in shifts.iter().enumerate() {
-        apply_implicit_shift_device(session, &mut d_h, &mut d_q, n, shift, shift_index)?;
-    }
-
-    let mut q_memory = vec![Complex64::ZERO; n * n];
-    let mut h_memory = vec![Complex64::ZERO; n * n];
-    d_q.copy_to_column_major(session, &mut q_memory);
-    d_h.copy_to_column_major(session, &mut h_memory);
-
-    let q = Array2::from_shape_vec((n, n).f(), q_memory)
-        .map_err(|error| format!("invalid MAGMA QR rotation shape: {error}"))?;
-    let h = Array2::from_shape_vec((n, n).f(), h_memory)
-        .map_err(|error| format!("invalid MAGMA QR Hessenberg shape: {error}"))?;
-    Ok((q, h))
-}
-
-fn apply_implicit_shift_device(
-    session: &MagmaSession,
-    h: &mut DeviceMatrix,
-    q: &mut DeviceMatrix,
-    n: usize,
-    shift: Complex64,
-    shift_index: usize,
-) -> Result<(), String> {
-    if n < 2 {
-        return Ok(());
-    }
-
-    let mut f = get_device_scalar(session, h.element_ptr(0, 0))? - shift;
-    let mut g = get_device_scalar(session, h.element_ptr(1, 0))?;
-
-    for i in 0..(n - 1) {
-        let (c, s, r) = zlartg_device_scalar(f, g);
-
-        if i > 0 {
-            set_device_scalar(session, h.element_mut_ptr(i, i - 1), r)?;
-            set_device_scalar(session, h.element_mut_ptr(i + 1, i - 1), Complex64::ZERO)?;
-        }
-
-        apply_givens_left_device(session, h, n, i, c, s);
-        apply_givens_right_device(session, h, n, i, c, s);
-        accumulate_givens_device(session, q, n, i, shift_index, c, s);
-
-        if i > 0 && i + 1 < n {
-            set_device_scalar(session, h.element_mut_ptr(i + 1, i - 1), Complex64::ZERO)?;
-        }
-
-        if i + 2 < n {
-            f = get_device_scalar(session, h.element_ptr(i + 1, i))?;
-            g = get_device_scalar(session, h.element_ptr(i + 2, i))?;
-        }
-    }
-
-    cleanup_hessenberg_roundoff_device(session, h, n)?;
-    Ok(())
-}
-
-#[inline]
-fn zlartg_device_scalar(f: Complex64, g: Complex64) -> (f64, Complex64, Complex64) {
-    let mut c = 0.0;
-    let mut s = Complex64::ZERO;
-    let mut r = Complex64::ZERO;
-    unsafe {
-        zlartg_(&f, &g, &mut c, &mut s, &mut r);
-    }
-    (c, s, r)
-}
-
-fn apply_givens_left_device(
-    session: &MagmaSession,
-    h: &mut DeviceMatrix,
-    n: usize,
-    i: usize,
-    c: f64,
-    s: Complex64,
-) {
-    let columns = n - i;
-    if columns == 0 {
-        return;
-    }
-    unsafe {
-        magmablas_zrot(
-            expect_magma_int(columns, "givens left columns"),
-            h.element_mut_ptr(i, i),
-            h.lda,
-            h.element_mut_ptr(i + 1, i),
-            h.lda,
-            c,
-            s,
-            session.queue.raw,
-        );
-    }
-}
-
-fn apply_givens_right_device(
-    session: &MagmaSession,
-    h: &mut DeviceMatrix,
-    n: usize,
-    i: usize,
-    c: f64,
-    s: Complex64,
-) {
-    let rows = usize::min(i + 3, n);
-    if rows == 0 {
-        return;
-    }
-    unsafe {
-        magmablas_zrot(
-            expect_magma_int(rows, "givens right rows"),
-            h.element_mut_ptr(0, i),
-            1,
-            h.element_mut_ptr(0, i + 1),
-            1,
-            c,
-            s.conj(),
-            session.queue.raw,
-        );
-    }
-}
-
-fn accumulate_givens_device(
-    session: &MagmaSession,
-    q: &mut DeviceMatrix,
-    n: usize,
-    i: usize,
-    shift_index: usize,
-    c: f64,
-    s: Complex64,
-) {
-    let rows = usize::min(i + shift_index + 2, n);
-    if rows == 0 {
-        return;
-    }
-    unsafe {
-        magmablas_zrot(
-            expect_magma_int(rows, "givens right rows"),
-            q.element_mut_ptr(0, i),
-            1,
-            q.element_mut_ptr(0, i + 1),
-            1,
-            c,
-            s.conj(),
-            session.queue.raw,
-        );
-    }
-}
-
-fn cleanup_hessenberg_roundoff_device(
-    session: &MagmaSession,
-    h: &mut DeviceMatrix,
-    n: usize,
-) -> Result<(), String> {
-    for row in 2..n {
-        for column in 0..row - 1 {
-            set_device_scalar(session, h.element_mut_ptr(row, column), Complex64::ZERO)?;
-        }
-    }
-    Ok(())
-}
-
-fn get_device_scalar(
-    session: &MagmaSession,
-    ptr: *const Complex64,
-) -> Result<Complex64, String> {
-    let mut value = Complex64::ZERO;
-    unsafe {
-        magma_zgetvector(1, ptr, 1, &mut value, 1, session.queue.raw);
-    }
-    memory::record_device_to_host_copy(std::mem::size_of::<Complex64>());
-    Ok(value)
-}
-
-fn set_device_scalar(
-    session: &MagmaSession,
-    ptr: *mut Complex64,
-    value: Complex64,
-) -> Result<(), String> {
-    unsafe {
-        magma_zsetvector(1, &value, 1, ptr, 1, session.queue.raw);
-    }
-    memory::record_host_to_device_copy(std::mem::size_of::<Complex64>());
-    Ok(())
 }
 
 #[cfg(test)]

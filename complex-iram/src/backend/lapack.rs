@@ -4,9 +4,9 @@ use num_complex::Complex64;
 use crate::backend::Backend;
 use crate::error::IramError;
 use crate::linalg::lapack::{self, SchurOutput, ZgemmTranspose};
-use crate::linalg::ops::{norm2, OrthogonalizedVector, orthogonalize_with_reorthogonalization};
 use crate::linalg::shifted_qr::shifted_qr_filter;
 use crate::operator::LinearOperator;
+use crate::linalg::ops::{OrthogonalizedVector, orthogonalize_with_reorthogonalization};
 
 #[derive(Debug, Default)]
 pub struct LapackBackend;
@@ -18,7 +18,7 @@ impl LapackBackend {
 }
 
 impl Backend for LapackBackend {
-    type PreparedOperator<'operator> = &'operator dyn LinearOperator where Self: 'operator;
+    type OperatorWorkspace = ();
     type ArnoldiWorkspace = ();
     type RitzDecomposition = SchurOutput;
 
@@ -26,20 +26,11 @@ impl Backend for LapackBackend {
         "lapack"
     }
 
-
-    fn prepare_operator<'operator>(
+    fn prepare_operator(
         &mut self,
-        operator: &'operator dyn LinearOperator,
-    ) -> Result<Self::PreparedOperator<'operator>, IramError> {
-        Ok(operator)
-    }
-
-    fn prepared_operator_dimension(&self, operator: &Self::PreparedOperator<'_>) -> usize {
-        (**operator).dimension()
-    }
-
-    fn prepared_operator_description(&self, operator: &Self::PreparedOperator<'_>) -> String {
-        (**operator).description()
+        _operator: &dyn LinearOperator,
+    ) -> Result<Self::OperatorWorkspace, IramError> {
+        Ok(())
     }
 
     fn create_arnoldi_workspace(
@@ -51,16 +42,16 @@ impl Backend for LapackBackend {
     }
 
 
-    fn apply_operator_to_arnoldi_column(
+    fn apply_operator_to_basis_vector(
         &mut self,
-        operator: &Self::PreparedOperator<'_>,
-        _workspace: &mut Self::ArnoldiWorkspace,
+        _operator_workspace: &mut Self::OperatorWorkspace,
+        _arnoldi_workspace: &mut Self::ArnoldiWorkspace,
+        operator: &dyn LinearOperator,
         basis: &Array2<Complex64>,
         column: usize,
-        candidate: &mut Array1<Complex64>,
-    ) -> Result<f64, IramError> {
-        (**operator).apply_into(basis.column(column), candidate.view_mut())?;
-        Ok(norm2(candidate))
+        output: &mut Array1<Complex64>,
+    ) -> Result<(), IramError> {
+        operator.apply_into(basis.column(column), output.view_mut())
     }
 
     fn orthogonalize_arnoldi_candidate(

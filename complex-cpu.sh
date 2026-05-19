@@ -2,7 +2,7 @@
 #SBATCH --job-name=complex-cpu
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=24
-#SBATCH --time=01:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=c24m256
 #SBATCH --output=slurm-%x.out
 #SBATCH --error=slurm-%x.err
@@ -59,13 +59,13 @@ echo "========================================"
     ./target/release/complex-iram \
         --backend lapack \
         --matrix-file matrices/quantum.mtx \
-        --nev 8 \
+        --nev 4 \
         --ncv 200 \
         --max-restarts=10000 \
-        --tol=1e-16 \
+        --tol=1e-12 \
+        --seed 234 \
         --target largest-magnitude \
         --output "${REPORT_FILE}"
-
 
 for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
     JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
@@ -79,7 +79,7 @@ for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
     ./target/release/complex-iram \
         --backend lapack \
         --matrix-file matrices/quantum.mtx \
-        --nev 8 \
+        --nev 4 \
         --ncv 200 \
         --max-restarts=10000 \
         --tol=1e-16 \

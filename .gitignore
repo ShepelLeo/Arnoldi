@@ -16,6 +16,8 @@ target/
 *.swo
 *~
 matrices/
+*.mtx
+*.py
 
 # macOS
 .DS_Store

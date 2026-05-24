@@ -68,47 +68,45 @@ if ldd ./target/release/complex-iram| grep -q 'not found'; then
 fi
 
 echo "Running program:"
-JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-REPORT_FILE="gpu_report_non_infl_${JOB_SUFFIX}.txt"
-echo "========================================"
-    echo "Running with no inflation"
+# JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
+# REPORT_FILE="gpu_report_4_${JOB_SUFFIX}.txt"
+# echo "========================================"
+#     echo "Running with no inflation"
+#     echo "Output: ${REPORT_FILE}"
+#     echo "========================================"
+
+#     ./target/release/complex-iram \
+#         --backend magma \
+#         --matrix-file matrices/atmosmodm.mtx \
+#         --nev 4 \
+#         --ncv 400 \
+#         --max-restarts=10000 \
+#         --tol=1e-12 \
+#         --seed 234 \
+#         --target largest-magnitude \
+#         --output "${REPORT_FILE}"
+
+
+for NEV in 4 8 16 32 64; do
+    JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
+    REPORT_FILE="gpu_quantum_${NEV}_${JOB_SUFFIX}.txt"
+
+    echo "========================================"
+    echo "Running with ritz-inflation=${NEV}"
     echo "Output: ${REPORT_FILE}"
     echo "========================================"
 
     ./target/release/complex-iram \
         --backend magma \
         --matrix-file matrices/quantum.mtx \
-        --nev 8 \
+        --nev "${NEV}" \
         --ncv 200 \
         --max-restarts=10000 \
         --tol=1e-12 \
         --seed 234 \
         --target largest-magnitude \
-        --ritz-inflation=1.0 \
         --output "${REPORT_FILE}"
 
-
-# for RITZ_INFLATION in 1.0 1.02 1.05 1.08 1.1 1.15; do
-#     JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-#     REPORT_FILE="gpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
-
-#     echo "========================================"
-#     echo "Running with ritz-inflation=${RITZ_INFLATION}"
-#     echo "Output: ${REPORT_FILE}"
-#     echo "========================================"
-
-#     ./target/release/complex-iram \
-#         --backend magma \
-#         --matrix-file matrices/quantum.mtx \
-#         --nev 4 \
-#         --ncv 200 \
-#         --max-restarts=10000 \
-#         --tol=1e-12 \
-#         --seed 234 \
-#         --target largest-magnitude \
-#         --ritz-inflation="${RITZ_INFLATION}" \
-#         --output "${REPORT_FILE}"
-
-# done
+done
 
 echo "End date: $(date)"

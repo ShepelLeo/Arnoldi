@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=complex-cpu
+#SBATCH --job-name=ritz
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=24
 #SBATCH --time=10:00:00
 #SBATCH --partition=c24m256
-#SBATCH --output=slurm-%x.out
-#SBATCH --error=slurm-%x.err
+#SBATCH --output=slurm-ritz-%x.out
+#SBATCH --error=slurm-ritz-%x.err
 
 set -e
 
@@ -45,72 +45,50 @@ echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 echo "OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS"
 echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
 
+
 echo "Checking binary libraries:"
 ldd ./target/release/complex-iram | grep -E "openblas|lapack|not found" || true
 
 echo "Running program:"
-# JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-# REPORT_FILE="cpu_report_non_infl_${JOB_SUFFIX}.txt"
-# echo "========================================"
-#     echo "Running with no inflation"
-#     echo "Output: ${REPORT_FILE}"
-#     echo "========================================"
-
-#     ./target/release/complex-iram \
-#         --backend lapack \
-#         --operator convection-diffusion \
-#         --dimension 1000 \
-#         --rho 0 \
-#         --nev 4 \
-#         --ncv 30 \
-#         --max-restarts=10000 \
-#         --tol=1e-12 \
-#         --seed 234 \
-#         --target largest-magnitude \
-#         --output "${REPORT_FILE}"
-
-
-for NEV in 4 8 16 32 64; do
-    JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-    REPORT_FILE="cpu_quantum_${NEV}_${JOB_SUFFIX}.txt"
-
-    echo "========================================"
-    echo "Running with ritz-inflation=${NEV}"
+MATRIX_NAME="cgap4549.mtx"
+JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
+REPORT_FILE="ritz_inflation/ext_${MATRIX_NAME}_non_infl_${JOB_SUFFIX}.txt"
+echo "========================================"
+    echo "Running with no inflation"
     echo "Output: ${REPORT_FILE}"
     echo "========================================"
 
     ./target/release/complex-iram \
         --backend lapack \
-        --matrix-file matrices/quantum.mtx \
-        --nev "${NEV}" \
-        --ncv 200 \
+        --matrix-file "matrices/${MATRIX_NAME}" \
+        --nev 4 \
+        --ncv 30 \
         --max-restarts=10000 \
-        --tol=1e-12 \
+        --tol=1e-16 \
         --seed 234 \
         --target largest-magnitude \
         --output "${REPORT_FILE}"
 
+
+for RITZ_INFLATION in 1.00 1.05 1.1 1.15 1.2; do
+    JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
+    REPORT_FILE="ritz_inflation/ext_${MATRIX_NAME}_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
+
+    echo "========================================"
+    echo "Running with ritz-inflation=${RITZ_INFLATION}"
+    echo "Output: ${REPORT_FILE}"
+    echo "========================================"
+
+    ./target/release/complex-iram \
+        --backend lapack \
+        --matrix-file "matrices/${MATRIX_NAME}" \
+        --nev 4 \
+        --ncv 30 \
+        --max-restarts=10000 \
+        --tol=1e-16 \
+        --ritz-inflation="${RITZ_INFLATION}" \
+        --target largest-magnitude \
+        --output "${REPORT_FILE}"
+
 done
-
-# for RITZ_INFLATION in 1.02 1.05 1.08 1.1 1.15; do
-#     JOB_SUFFIX="${SLURM_JOB_ID:-manual}"
-#     REPORT_FILE="cpu_report_ritz_${RITZ_INFLATION}_${JOB_SUFFIX}.txt"
-
-#     echo "========================================"
-#     echo "Running with ritz-inflation=${RITZ_INFLATION}"
-#     echo "Output: ${REPORT_FILE}"
-#     echo "========================================"
-
-#     ./target/release/complex-iram \
-#         --backend lapack \
-#         --matrix-file matrices/quantum.mtx \
-#         --nev 4 \
-#         --ncv 200 \
-#         --max-restarts=10000 \
-#         --tol=1e-16 \
-#         --ritz-inflation="${RITZ_INFLATION}" \
-#         --target smallest-magnitude \
-#         --output "${REPORT_FILE}"
-
-# done
 echo "End date: $(date)"

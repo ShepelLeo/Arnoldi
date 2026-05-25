@@ -22,7 +22,7 @@ use rand::rngs::StdRng;
 
 /// CLI
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Complex IRAM written with ndarray")]
+#[command(author, version, about = "Complex IRAM solver")]
 struct Cli {
     /// Размерность задачи
     #[arg(long, default_value_t = 32)]

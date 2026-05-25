@@ -3,4 +3,3 @@ pub mod lapack;
 pub mod magma;
 pub mod ops;
 pub mod shifted_qr;
-pub mod small;

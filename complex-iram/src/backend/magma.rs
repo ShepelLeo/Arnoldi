@@ -191,8 +191,7 @@ fn orthogonalize_against_host_basis_via_magma(
     debug_assert!(h_column.len() >= basis_columns);
 
     let mut d_basis = DeviceMatrix::new(basis_rows, basis_columns);
-    // Загрузим host-базис на устройство (rows × cols, ld = rows).
-    upload_host_to_device_matrix(session, &mut d_basis, basis_host, basis_rows);
+    d_basis.copy_from_host_slice(session, basis_host, basis_rows);
 
     let mut d_candidate = DeviceVector::from_slice(session, candidate_host);
     let mut d_projection = DeviceVector::new(basis_columns);
@@ -212,25 +211,6 @@ fn orthogonalize_against_host_basis_via_magma(
     )
 }
 
-fn upload_host_to_device_matrix(
-    session: &MagmaSession,
-    device: &mut DeviceMatrix,
-    host: &[Complex64],
-    host_ld: usize,
-) {
-    let rows = device.rows();
-    let cols = device.columns();
-    if rows == 0 || cols == 0 {
-        return;
-    }
-    // Загружаем колоночно, чтобы не дёргать magma_zsetmatrix-internal
-    // напрямую из публичного API.
-    for col in 0..cols {
-        let start = col * host_ld;
-        let column_slice = &host[start..start + rows];
-        device.copy_column_from_slice(session, col, column_slice);
-    }
-}
 
 impl Backend for MagmaBackend {
     type OperatorHandle = MagmaOperatorHandle;
@@ -302,7 +282,7 @@ impl Backend for MagmaBackend {
     ) {
         debug_assert!(column < basis.capacity);
         debug_assert_eq!(out.len(), basis.rows);
-        unsafe_copy_basis_column_to_host(&self.session, &basis.d_basis, column, out);
+        basis.d_basis.copy_column_to_slice(&self.session, column, out);
     }
 
     fn write_vector(&mut self, vector: &mut Self::VectorHandle, values: &[Complex64]) {
@@ -465,28 +445,3 @@ impl Backend for MagmaBackend {
     }
 }
 
-/// Скачивает одну колонку базиса на host. Используется только редким путём
-/// рестарта; в горячем цикле Арнольди мы не читаем базис на host.
-///
-/// Текущая публичная поверхность `linalg::magma` не предоставляет
-/// "скачать одну колонку", поэтому пока тянем целиком и вырезаем срез.
-/// Дальнейшая оптимизация: добавить `DeviceMatrix::copy_column_to_slice`
-/// и использовать его здесь.
-fn unsafe_copy_basis_column_to_host(
-    session: &MagmaSession,
-    d_basis: &DeviceMatrix,
-    column: usize,
-    out: &mut [Complex64],
-) {
-    let rows = d_basis.rows();
-    debug_assert!(column < d_basis.columns());
-    debug_assert_eq!(out.len(), rows);
-    if rows == 0 {
-        return;
-    }
-
-    let mut tmp_host = vec![Complex64::ZERO; rows * d_basis.columns()];
-    d_basis.copy_to_column_major(session, &mut tmp_host);
-    let start = column * rows;
-    out.copy_from_slice(&tmp_host[start..start + rows]);
-}

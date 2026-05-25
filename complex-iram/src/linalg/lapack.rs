@@ -1,4 +1,8 @@
-use ndarray::{Array1, Array2, ArrayView2, ShapeBuilder};
+//! LAPACK/OpenBLAS FFI слой. Только slice/column-major API.
+//!
+//! Все матрицы — непрерывные `&[Complex64]` / `&mut [Complex64]` в column-major
+//! раскладке с явным `ld`. Никаких `ndarray`-сигнатур.
+
 use num_complex::Complex64;
 use std::os::raw::{c_char, c_int};
 
@@ -14,59 +18,28 @@ pub enum ZgemmTranspose {
     ConjugateTranspose,
 }
 
+/// Результат малой спектральной задачи (Schur форма от `zhseqr`).
 #[derive(Debug)]
 pub struct SchurOutput {
-    /// Eigenvalues.
+    /// Собственные значения.
     pub w: Vec<Complex64>,
-    /// Schur form T in LAPACK/Fortran column-major layout.
+    /// Schur форма `T` в column-major раскладке (после `zhseqr`).
     pub t: Vec<Complex64>,
-    /// Schur vectors Z in LAPACK/Fortran column-major layout.
+    /// Schur векторы `Z` в column-major раскладке.
     pub z: Vec<Complex64>,
 }
 
 #[derive(Debug)]
 pub enum SchurError {
     NotSquare,
-    BadIloIhi,
     LapackIllegalArgument(i32),
     NoConvergence(i32),
     DimensionMismatch,
-    InvalidEigenIndex(usize),
 }
 
 #[inline]
 fn zero() -> Complex64 {
     Complex64::ZERO
-}
-
-/// Copies an ndarray row-major/strided matrix into LAPACK column-major storage.
-///
-/// This allocation is necessary unless the caller already owns a contiguous
-/// Fortran-order buffer, because LAPACK mutates its input in-place.
-fn to_fortran_vec(a: &Array2<Complex64>) -> Vec<Complex64> {
-    let (rows, cols) = a.dim();
-    let mut out = Vec::with_capacity(rows * cols);
-
-    for j in 0..cols {
-        for i in 0..rows {
-            out.push(a[(i, j)]);
-        }
-    }
-
-    out
-}
-
-#[inline]
-fn fortran_view<'a>(
-    rows: usize,
-    cols: usize,
-    data: &'a [Complex64],
-) -> Result<ArrayView2<'a, Complex64>, SchurError> {
-    if data.len() != rows * cols {
-        return Err(SchurError::DimensionMismatch);
-    }
-
-    ArrayView2::from_shape((rows, cols).f(), data).map_err(|_| SchurError::DimensionMismatch)
 }
 
 unsafe extern "C" {
@@ -108,278 +81,8 @@ fn trans_char(trans: ZgemmTranspose) -> c_char {
     }
 }
 
-fn transposed_shape(rows: usize, columns: usize, trans: ZgemmTranspose) -> (usize, usize) {
-    match trans {
-        ZgemmTranspose::None => (rows, columns),
-        ZgemmTranspose::ConjugateTranspose => (columns, rows),
-    }
-}
-
-pub fn zgemm(
-    trans_a: ZgemmTranspose,
-    trans_b: ZgemmTranspose,
-    a: ArrayView2<'_, Complex64>,
-    b: ArrayView2<'_, Complex64>,
-) -> Array2<Complex64> {
-    let (a_rows, a_columns) = a.dim();
-    let (b_rows, b_columns) = b.dim();
-    let (a_effective_rows, a_effective_columns) = transposed_shape(a_rows, a_columns, trans_a);
-    let (b_effective_rows, b_effective_columns) = transposed_shape(b_rows, b_columns, trans_b);
-    assert_eq!(a_effective_columns, b_effective_rows);
-
-    let a_strides = a.strides();
-    assert!(
-        a_rows <= 1 || a_strides[0] == 1,
-        "zgemm expects column-major left matrix storage"
-    );
-    assert!(
-        a_columns <= 1 || a_strides[1] == a_rows as isize,
-        "zgemm expects column-major left matrix storage"
-    );
-    let b_strides = b.strides();
-    assert!(
-        b_rows <= 1 || b_strides[0] == 1,
-        "zgemm expects column-major right matrix storage"
-    );
-    assert!(
-        b_columns <= 1 || b_strides[1] == b_rows as isize,
-        "zgemm expects column-major right matrix storage"
-    );
-
-    let a_memory = a
-        .as_slice_memory_order()
-        .expect("zgemm expects contiguous left matrix storage");
-    let b_memory = b
-        .as_slice_memory_order()
-        .expect("zgemm expects contiguous right matrix storage");
-    let mut result = Array2::zeros((a_effective_rows, b_effective_columns).f());
-    let result_memory = result
-        .as_slice_memory_order_mut()
-        .expect("zgemm result must be contiguous");
-
-    let m = a_effective_rows as c_int;
-    let n = b_effective_columns as c_int;
-    let k = a_effective_columns as c_int;
-    let lda = a_rows.max(1) as c_int;
-    let ldb = b_rows.max(1) as c_int;
-    let ldc = a_effective_rows.max(1) as c_int;
-    let alpha = Complex64::new(1.0, 0.0);
-    let beta = Complex64::ZERO;
-    let transa = trans_char(trans_a);
-    let transb = trans_char(trans_b);
-
-    unsafe {
-        zgemm_(
-            &transa,
-            &transb,
-            &m,
-            &n,
-            &k,
-            &alpha,
-            a_memory.as_ptr(),
-            &lda,
-            b_memory.as_ptr(),
-            &ldb,
-            &beta,
-            result_memory.as_mut_ptr(),
-            &ldc,
-        );
-    }
-
-    result
-}
-
-pub fn zgemv(
-    trans: ZgemvTranspose,
-    matrix: ArrayView2<'_, Complex64>,
-    alpha: Complex64,
-    x: &[Complex64],
-    beta: Complex64,
-    y: &mut [Complex64],
-) {
-    let (rows, columns) = matrix.dim();
-    let strides = matrix.strides();
-    assert!(
-        rows <= 1 || strides[0] == 1,
-        "zgemv expects column-major matrix storage"
-    );
-    assert!(
-        columns <= 1 || strides[1] == rows as isize,
-        "zgemv expects column-major matrix storage"
-    );
-    let matrix_column_major = matrix
-        .as_slice_memory_order()
-        .expect("zgemv expects contiguous matrix storage");
-
-    let (trans_char, x_len, y_len) = match trans {
-        ZgemvTranspose::None => (b'N' as c_char, columns, rows),
-        ZgemvTranspose::ConjugateTranspose => (b'C' as c_char, rows, columns),
-    };
-    assert_eq!(x.len(), x_len);
-    assert_eq!(y.len(), y_len);
-
-    let rows_i = rows as c_int;
-    let columns_i = columns as c_int;
-    let lda = rows_i;
-    let incx = 1 as c_int;
-    let incy = 1 as c_int;
-
-    unsafe {
-        zgemv_(
-            &trans_char,
-            &rows_i,
-            &columns_i,
-            &alpha,
-            matrix_column_major.as_ptr(),
-            &lda,
-            x.as_ptr(),
-            &incx,
-            &beta,
-            y.as_mut_ptr(),
-            &incy,
-        );
-    }
-}
-
-pub fn zhseqr_schur(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
-    let (n, m) = h.dim();
-    if n != m {
-        return Err(SchurError::NotSquare);
-    }
-
-    if n == 0 {
-        return Ok(SchurOutput {
-            w: Vec::new(),
-            t: Vec::new(),
-            z: Vec::new(),
-        });
-    }
-
-    let n_i = n as i32;
-    let ilo = 1_i32;
-    let ihi = n_i;
-
-    let mut h_col = to_fortran_vec(h);
-    let mut w = vec![zero(); n];
-    let mut z = vec![zero(); n * n];
-
-    let mut work_query = [zero(); 1];
-    let mut info = 0_i32;
-
-    unsafe {
-        lapack::zhseqr(
-            b'S',
-            b'I',
-            n_i,
-            ilo,
-            ihi,
-            &mut h_col,
-            n_i,
-            &mut w,
-            &mut z,
-            n_i,
-            &mut work_query,
-            -1,
-            &mut info,
-        );
-    }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
-    }
-
-    let lwork = (work_query[0].re as i32).max(n_i).max(1);
-    let mut work = vec![zero(); lwork as usize];
-
-    unsafe {
-        lapack::zhseqr(
-            b'S', b'I', n_i, ilo, ihi, &mut h_col, n_i, &mut w, &mut z, n_i, &mut work, lwork,
-            &mut info,
-        );
-    }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
-    }
-    if info > 0 {
-        return Err(SchurError::NoConvergence(info));
-    }
-
-    Ok(SchurOutput { w, t: h_col, z })
-}
-
-pub fn ztrevc_right_selected(
-    decomposition: &mut SchurOutput,
-    indices: &[usize],
-    dim: usize,
-) -> Result<Array2<Complex64>, SchurError> {
-    if decomposition.t.len() != dim * dim || decomposition.z.len() != dim * dim {
-        return Err(SchurError::DimensionMismatch);
-    }
-
-    for &j in indices {
-        if j >= dim {
-            return Err(SchurError::InvalidEigenIndex(j));
-        }
-    }
-
-    if dim == 0 || indices.is_empty() {
-        return Ok(Array2::zeros((dim, 0).f()));
-    }
-
-    let mut select = vec![0_i32; dim];
-    for &j in indices {
-        select[j] = 1;
-    }
-
-    let mm = indices.len() as i32;
-    let mut m_out = 0_i32;
-
-    let mut vl_dummy = [zero(); 1];
-    let mut vr_sel = vec![zero(); dim * indices.len()];
-    let mut work = vec![zero(); 2 * dim];
-    let mut rwork = vec![0.0_f64; dim];
-    let mut info = 0_i32;
-
-    unsafe {
-        lapack::ztrevc(
-            b'R',
-            b'S',
-            &select,
-            dim as i32,
-            &mut decomposition.t,
-            dim as i32,
-            &mut vl_dummy,
-            1,
-            &mut vr_sel,
-            dim as i32,
-            mm,
-            &mut m_out,
-            &mut work,
-            &mut rwork,
-            &mut info,
-        );
-    }
-
-    if info < 0 {
-        return Err(SchurError::LapackIllegalArgument(-info));
-    }
-
-    let x_sel = fortran_view(dim, m_out as usize, &vr_sel)?;
-    let z = fortran_view(dim, dim, &decomposition.z)?;
-
-    // Единственная новая матрица здесь — результат Z * X.
-    Ok(z.dot(&x_sel))
-}
-
-pub fn shifted_qr_filter(
-    hessenberg: &Array2<Complex64>,
-    shifts: &[Complex64],
-) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
-    crate::linalg::shifted_qr::shifted_qr_filter(hessenberg, shifts)
-}
-
-/// Slice-based ZGEMM (column-major). Все операнды непрерывные, ld передаются явно.
+/// `C = op(A) * op(B)` (alpha=1, beta=0). Все буферы column-major, ld явные.
+/// `m × n` — финальный размер `C`; `k` — общая размерность контракции.
 pub fn zgemm_slice(
     trans_a: ZgemmTranspose,
     trans_b: ZgemmTranspose,
@@ -427,7 +130,8 @@ pub fn zgemm_slice(
     }
 }
 
-/// Slice-based ZGEMV (column-major). `rows × cols` — фактические размеры матрицы.
+/// `y = alpha * op(A) * x + beta * y`. Все буферы column-major, ld явное.
+/// `rows × cols` — фактические размеры `A`; форма входа/выхода зависит от `trans`.
 pub fn zgemv_slice(
     trans: ZgemvTranspose,
     rows: usize,
@@ -470,8 +174,9 @@ pub fn zgemv_slice(
     }
 }
 
-/// Малая спектральная задача: ZHSEQR → Schur форма + eigenvalues. Вход —
-/// column-major `n×n`. Возвращает (w, T_col, Z_col).
+/// Schur-форма + собственные значения малой плотной `n×n` матрицы через
+/// LAPACK `zhseqr`. Вход — column-major, не изменяется. Выход — column-major
+/// `T`, `Z`, `w`.
 pub fn zhseqr_schur_slice(
     h_col_major: &[Complex64],
     n: usize,
@@ -530,7 +235,8 @@ pub fn zhseqr_schur_slice(
     Ok(SchurOutput { w, t: h_col, z })
 }
 
-/// Все правые собственные векторы Schur-формы (`Z * X`) в column-major.
+/// Все правые собственные векторы Schur-формы, бэк-трансформированные
+/// Schur-векторами (т.е. `Z * X`). Выход — column-major `dim × dim`.
 pub fn ztrevc_all_right_slice(
     decomposition: &mut SchurOutput,
     dim: usize,
@@ -576,7 +282,6 @@ pub fn ztrevc_all_right_slice(
         return Err(SchurError::LapackIllegalArgument(-info));
     }
 
-    // result = Z * X, оба column-major dim×dim, через zgemm_slice.
     let mut result = vec![zero(); dim * dim];
     zgemm_slice(
         ZgemmTranspose::None,
@@ -592,282 +297,4 @@ pub fn ztrevc_all_right_slice(
         dim,
     );
     Ok(result)
-}
-
-pub fn last_r_col_without_diag_from_zgeqrf(
-    a_cols: &[Array1<Complex64>],
-    z: &Array1<Complex64>,
-) -> Result<Vec<Complex64>, String> {
-    let nrows = z.len();
-    let k = a_cols.len();
-    let ncols = k + 1;
-
-    if nrows == 0 {
-        return Err("empty vectors are not supported".into());
-    }
-
-    for (j, col) in a_cols.iter().enumerate() {
-        if col.len() != nrows {
-            return Err(format!(
-                "column {} has length {}, expected {}",
-                j,
-                col.len(),
-                nrows
-            ));
-        }
-    }
-
-    // Один буфер под A = [a_cols, z] в column-major layout.
-    // Старый вариант делал clone всего Vec<Array1>, clone(z), push, flat_map/collect.
-    let mut mat = Vec::with_capacity(nrows * ncols);
-    for col in a_cols {
-        mat.extend(col.iter().copied());
-    }
-    mat.extend(z.iter().copied());
-
-    let m = nrows as i32;
-    let n = ncols as i32;
-    let lda = m.max(1);
-
-    let min_mn = m.min(n);
-    let mut tau = vec![zero(); min_mn as usize];
-
-    let mut work_query = [zero(); 1];
-    let mut info = 0;
-
-    unsafe {
-        lapack::zgeqrf(
-            m,
-            n,
-            &mut mat,
-            lda,
-            &mut tau,
-            &mut work_query,
-            -1,
-            &mut info,
-        );
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf workspace query failed, info = {}", info));
-    }
-
-    let lwork = work_query[0].re as i32;
-    if lwork <= 0 {
-        return Err(format!("zgeqrf returned invalid lwork = {}", lwork));
-    }
-
-    let mut work = vec![zero(); lwork as usize];
-
-    unsafe {
-        lapack::zgeqrf(m, n, &mut mat, lda, &mut tau, &mut work, lwork, &mut info);
-    }
-    if info != 0 {
-        return Err(format!("zgeqrf failed, info = {}", info));
-    }
-
-    // R хранится в верхнем треугольнике mat. Последний столбец имеет offset k * lda.
-    // Без диагонального элемента берём строки 0..rlen, где rlen = min(k, nrows).
-    let rlen = k.min(nrows);
-    let offset = k * lda as usize;
-
-    Ok(mat[offset..offset + rlen].to_vec())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::array;
-    use num_complex::Complex64;
-
-    #[test]
-    fn zgemv_wraps_column_major_blas() {
-        let one = Complex64::new(1.0, 0.0);
-        let zero = Complex64::ZERO;
-        let a = Array2::from_shape_vec(
-            (2, 2).f(),
-            vec![
-                Complex64::new(1.0, 0.0),
-                Complex64::new(3.0, 0.0),
-                Complex64::new(2.0, 0.0),
-                Complex64::new(4.0, 0.0),
-            ],
-        )
-        .unwrap();
-
-        let x = vec![Complex64::new(5.0, 0.0), Complex64::new(6.0, 0.0)];
-        let mut y = vec![Complex64::ZERO; 2];
-        zgemv(ZgemvTranspose::None, a.view(), one, &x, zero, &mut y);
-        assert_eq!(
-            y,
-            vec![Complex64::new(17.0, 0.0), Complex64::new(39.0, 0.0)]
-        );
-
-        let x = vec![Complex64::new(7.0, 0.0), Complex64::new(11.0, 0.0)];
-        let mut y = vec![Complex64::ZERO; 2];
-        zgemv(
-            ZgemvTranspose::ConjugateTranspose,
-            a.view(),
-            one,
-            &x,
-            zero,
-            &mut y,
-        );
-        assert_eq!(
-            y,
-            vec![Complex64::new(40.0, 0.0), Complex64::new(58.0, 0.0)]
-        );
-    }
-
-    #[test]
-    fn zgemm_wraps_column_major_blas() {
-        let a = Array2::from_shape_vec(
-            (2, 2).f(),
-            vec![
-                Complex64::new(1.0, 0.0),
-                Complex64::new(3.0, 0.0),
-                Complex64::new(2.0, 0.0),
-                Complex64::new(4.0, 0.0),
-            ],
-        )
-        .unwrap();
-        let b = Array2::from_shape_vec(
-            (2, 2).f(),
-            vec![
-                Complex64::new(5.0, 0.0),
-                Complex64::new(7.0, 0.0),
-                Complex64::new(6.0, 0.0),
-                Complex64::new(8.0, 0.0),
-            ],
-        )
-        .unwrap();
-
-        let c = zgemm(
-            ZgemmTranspose::None,
-            ZgemmTranspose::None,
-            a.view(),
-            b.view(),
-        );
-
-        assert_eq!(
-            c,
-            Array2::from_shape_vec(
-                (2, 2).f(),
-                vec![
-                    Complex64::new(19.0, 0.0),
-                    Complex64::new(43.0, 0.0),
-                    Complex64::new(22.0, 0.0),
-                    Complex64::new(50.0, 0.0),
-                ],
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "zgemv expects column-major matrix storage")]
-    fn zgemv_rejects_row_major_matrix() {
-        let a = Array2::from_shape_vec(
-            (2, 2),
-            vec![
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, 0.0),
-                Complex64::new(3.0, 0.0),
-                Complex64::new(4.0, 0.0),
-            ],
-        )
-        .unwrap();
-        let x = vec![Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0)];
-        let mut y = vec![Complex64::ZERO; 2];
-        zgemv(
-            ZgemvTranspose::None,
-            a.view(),
-            Complex64::new(1.0, 0.0),
-            &x,
-            Complex64::ZERO,
-            &mut y,
-        );
-    }
-
-    #[test]
-    fn zhseqr_schur_smoke_test() {
-        let h = array![
-            [
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, 1.0),
-                Complex64::new(0.0, 0.0),
-            ],
-            [
-                Complex64::new(0.5, 0.0),
-                Complex64::new(3.0, 0.0),
-                Complex64::new(4.0, -1.0),
-            ],
-            [
-                Complex64::new(0.0, 0.0),
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, 0.0),
-            ],
-        ];
-
-        let mut out = zhseqr_schur(&h).unwrap();
-        println!("{:?}", out.t);
-        println!("{:?}\n\n", out.w);
-        let vecs = ztrevc_right_selected(&mut out, &[0, 1], 3);
-        println!("{:?}", vecs);
-        assert_eq!(out.w.len(), h.nrows());
-    }
-
-    #[test]
-    fn shifted_qr_filter_preserves_similarity() {
-        let h = array![
-            [
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, 1.0),
-                Complex64::new(0.0, 0.0),
-            ],
-            [
-                Complex64::new(0.5, 0.0),
-                Complex64::new(3.0, 0.0),
-                Complex64::new(4.0, -1.0),
-            ],
-            [
-                Complex64::new(0.0, 0.0),
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, 0.0),
-            ],
-        ];
-
-        let (q, filtered_h) = shifted_qr_filter(
-            &h,
-            &[
-                Complex64::new(3.0, 1.0),
-                Complex64::new(1.0, 0.0),
-                Complex64::new(2.0, -0.5),
-            ],
-        )
-        .unwrap();
-
-        let q_star = q.t().mapv(|x| x.conj());
-        let reconstructed = q.dot(&filtered_h).dot(&q_star);
-        let reconstruction_error = frobenius_norm(&(reconstructed - h));
-        assert!(
-            reconstruction_error < 1.0e-10,
-            "reconstruction_error={reconstruction_error}"
-        );
-
-        let identity = q_star.dot(&q);
-        let mut expected_identity = Array2::zeros((3, 3).f());
-        for index in 0..3 {
-            expected_identity[[index, index]] = Complex64::new(1.0, 0.0);
-        }
-        let unitary_error = frobenius_norm(&(identity - expected_identity));
-        assert!(unitary_error < 1.0e-10, "unitary_error={unitary_error}");
-    }
-
-    fn frobenius_norm(matrix: &Array2<Complex64>) -> f64 {
-        matrix
-            .iter()
-            .map(|entry| entry.norm_sqr())
-            .sum::<f64>()
-            .sqrt()
-    }
 }

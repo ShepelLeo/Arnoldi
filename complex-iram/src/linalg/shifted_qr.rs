@@ -1,5 +1,9 @@
+//! Multishift QR / unitary similarity на маленькой верхнехессенберговой
+//! матрице. Generic numerical-LA примитив: column-major in/out, без `ndarray`.
+//!
+//! Внутри используется row-major рабочий буфер для удобства cache pattern-а;
+//! на вход/выход — column-major (Fortran layout), как и во всём ядре.
 
-use ndarray::{Array2, ShapeBuilder};
 use num_complex::Complex64;
 
 unsafe extern "C" {
@@ -27,55 +31,9 @@ fn idx(n: usize, row: usize, column: usize) -> usize {
     row * n + column
 }
 
-/// Reusable storage for the shifted QR filter.
+/// Multishift QR filter. Вход/выход — column-major n×n `Vec<Complex64>`.
 ///
-/// The one-shot `shifted_qr_filter` creates this internally. If restart code is
-/// later changed to keep a backend/workspace object alive, use
-/// `shifted_qr_filter_with_workspace` to avoid reallocating these buffers on
-/// every restart.
-#[derive(Debug, Clone, Default)]
-pub struct ShiftedQrWorkspace {
-    n: usize,
-    h_row_major: Vec<Complex64>,
-    q_row_major: Vec<Complex64>,
-    h_fortran: Vec<Complex64>,
-    q_fortran: Vec<Complex64>,
-}
-
-impl ShiftedQrWorkspace {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_dimension(n: usize) -> Self {
-        let mut workspace = Self::new();
-        workspace.resize(n);
-        workspace
-    }
-
-    fn resize(&mut self, n: usize) {
-        self.n = n;
-        let len = n.saturating_mul(n);
-        self.h_row_major.resize(len, zero());
-        self.q_row_major.resize(len, zero());
-        self.h_fortran.resize(len, zero());
-        self.q_fortran.resize(len, zero());
-    }
-}
-
-/// Backward-compatible one-shot API.
-pub fn shifted_qr_filter(
-    hessenberg: &Array2<Complex64>,
-    shifts: &[Complex64],
-) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
-    let mut workspace = ShiftedQrWorkspace::new();
-    shifted_qr_filter_with_workspace(hessenberg, shifts, &mut workspace)
-}
-
-/// Slice-based shifted QR filter (column-major in/out).
-///
-/// Возвращает `(Q, H_filtered)` в column-major раскладке как обычные `Vec`-буферы
-/// без `ndarray`. Это generic-примитив для ядра IRAM/Arnoldi.
+/// Возвращает `(Q, H_filtered)` — оба в column-major, ld = n.
 pub fn shifted_qr_filter_slice(
     hessenberg: &[Complex64],
     n: usize,
@@ -85,25 +43,25 @@ pub fn shifted_qr_filter_slice(
         return Err("H buffer length must be n*n".into());
     }
 
-    let mut workspace = ShiftedQrWorkspace::new();
-    workspace.resize(n);
-
-    copy_col_major_to_row_major(hessenberg, &mut workspace.h_row_major, n);
-    fill_identity_row_major(&mut workspace.q_row_major, n);
-
     if n == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
 
+    let len = n * n;
+    let mut h_row_major = vec![zero(); len];
+    let mut q_row_major = vec![zero(); len];
+
+    copy_col_major_to_row_major(hessenberg, &mut h_row_major, n);
+    fill_identity_row_major(&mut q_row_major, n);
+
     if !shifts.is_empty() {
         let safe_threshold = safe_minimum_threshold(n);
-        let h_norm =
-            hessenberg_one_norm_row_major(&workspace.h_row_major, n).max(safe_threshold);
+        let h_norm = hessenberg_one_norm_row_major(&h_row_major, n).max(safe_threshold);
 
         for (shift_index, shift) in shifts.iter().copied().enumerate() {
             apply_implicit_shift_row_major(
-                &mut workspace.h_row_major,
-                &mut workspace.q_row_major,
+                &mut h_row_major,
+                &mut q_row_major,
                 n,
                 shift,
                 shift_index,
@@ -112,25 +70,16 @@ pub fn shifted_qr_filter_slice(
             );
         }
 
-        make_subdiagonal_real_nonnegative_row_major(
-            &mut workspace.h_row_major,
-            &mut workspace.q_row_major,
-            n,
-        );
-        deflate_small_subdiagonals_row_major(
-            &mut workspace.h_row_major,
-            n,
-            safe_threshold,
-            h_norm,
-        );
+        make_subdiagonal_real_nonnegative_row_major(&mut h_row_major, &mut q_row_major, n);
+        deflate_small_subdiagonals_row_major(&mut h_row_major, n, safe_threshold, h_norm);
     }
 
-    cleanup_hessenberg_roundoff_row_major(&mut workspace.h_row_major, n);
+    cleanup_hessenberg_roundoff_row_major(&mut h_row_major, n);
 
-    let mut q_fortran = vec![zero(); n * n];
-    let mut h_fortran = vec![zero(); n * n];
-    copy_row_major_to_fortran(&workspace.q_row_major, &mut q_fortran, n);
-    copy_row_major_to_fortran(&workspace.h_row_major, &mut h_fortran, n);
+    let mut q_fortran = vec![zero(); len];
+    let mut h_fortran = vec![zero(); len];
+    copy_row_major_to_col_major(&q_row_major, &mut q_fortran, n);
+    copy_row_major_to_col_major(&h_row_major, &mut h_fortran, n);
 
     Ok((q_fortran, h_fortran))
 }
@@ -146,87 +95,7 @@ fn copy_col_major_to_row_major(input: &[Complex64], output: &mut [Complex64], n:
     }
 }
 
-/// Workspace-aware shifted QR API.
-///
-/// Returns `(Q, H_filtered)` in Fortran/column-major ndarray layout.
-pub fn shifted_qr_filter_with_workspace(
-    hessenberg: &Array2<Complex64>,
-    shifts: &[Complex64],
-    workspace: &mut ShiftedQrWorkspace,
-) -> Result<(Array2<Complex64>, Array2<Complex64>), String> {
-    let (h_rows, h_cols) = hessenberg.dim();
-
-    if h_rows != h_cols {
-        return Err("H must be square".into());
-    }
-
-    let n = h_rows;
-    workspace.resize(n);
-
-    copy_ndarray_to_row_major(hessenberg, &mut workspace.h_row_major, n);
-    fill_identity_row_major(&mut workspace.q_row_major, n);
-
-    if n == 0 {
-        return Ok((
-            Array2::zeros((0, 0).f()),
-            Array2::zeros((0, 0).f()),
-        ));
-    }
-
-    if !shifts.is_empty() {
-        let safe_threshold = safe_minimum_threshold(n);
-        let h_norm = hessenberg_one_norm_row_major(&workspace.h_row_major, n)
-            .max(safe_threshold);
-
-        for (shift_index, shift) in shifts.iter().copied().enumerate() {
-            apply_implicit_shift_row_major(
-                &mut workspace.h_row_major,
-                &mut workspace.q_row_major,
-                n,
-                shift,
-                shift_index,
-                safe_threshold,
-                h_norm,
-            );
-        }
-
-        make_subdiagonal_real_nonnegative_row_major(
-            &mut workspace.h_row_major,
-            &mut workspace.q_row_major,
-            n,
-        );
-        deflate_small_subdiagonals_row_major(
-            &mut workspace.h_row_major,
-            n,
-            safe_threshold,
-            h_norm,
-        );
-    }
-
-    cleanup_hessenberg_roundoff_row_major(&mut workspace.h_row_major, n);
-
-    copy_row_major_to_fortran(&workspace.q_row_major, &mut workspace.q_fortran, n);
-    copy_row_major_to_fortran(&workspace.h_row_major, &mut workspace.h_fortran, n);
-
-    let q = Array2::from_shape_vec((n, n).f(), workspace.q_fortran.clone())
-        .expect("invalid Fortran rotation buffer shape");
-    let h = Array2::from_shape_vec((n, n).f(), workspace.h_fortran.clone())
-        .expect("invalid Fortran Hessenberg buffer shape");
-
-    Ok((q, h))
-}
-
-fn copy_ndarray_to_row_major(matrix: &Array2<Complex64>, output: &mut [Complex64], n: usize) {
-    debug_assert_eq!(output.len(), n * n);
-
-    for row in 0..n {
-        for column in 0..n {
-            output[idx(n, row, column)] = matrix[(row, column)];
-        }
-    }
-}
-
-fn copy_row_major_to_fortran(input: &[Complex64], output: &mut [Complex64], n: usize) {
+fn copy_row_major_to_col_major(input: &[Complex64], output: &mut [Complex64], n: usize) {
     debug_assert_eq!(input.len(), n * n);
     debug_assert_eq!(output.len(), n * n);
 
@@ -292,8 +161,6 @@ fn apply_implicit_shift_row_major(
             apply_givens_from_right_row_major(h, n, i, iend, c, s);
             accumulate_givens_row_major(rotation, n, i, shift_index, c, s);
 
-            // Keep the chased bulge explicitly clean. This replaces the old
-            // full O(n^2) cleanup after every shift.
             if i > 0 && i + 1 < n {
                 h[idx(n, i + 1, i - 1)] = zero();
             }
@@ -381,8 +248,6 @@ fn accumulate_givens_row_major(
     let c = Complex64::new(c, 0.0);
     let s_conj = s.conj();
 
-    // Same band-limited accumulation strategy as the previous implementation.
-    // It avoids touching the whole dense rotation matrix during early shifts.
     let row_count = usize::min(i + shift_index + 2, n);
 
     for row in 0..row_count {
@@ -414,19 +279,15 @@ fn make_subdiagonal_real_nonnegative_row_major(
         let phase = subdiagonal / magnitude;
         let phase_conj = phase.conj();
 
-        // Left phase scaling: row j + 1, columns j..n.
         for column in j..n {
             h[idx(n, j + 1, column)] *= phase_conj;
         }
 
-        // Right phase scaling: column j + 1, only rows that can be nonzero in
-        // Hessenberg structure.
         let last_row = usize::min(j + 2, n - 1);
         for row in 0..=last_row {
             h[idx(n, row, j + 1)] *= phase;
         }
 
-        // Keep accumulated Q consistent with the right phase scaling.
         for row in 0..n {
             rotation[idx(n, row, j + 1)] *= phase;
         }
@@ -499,49 +360,5 @@ fn cleanup_hessenberg_roundoff_row_major(h: &mut [Complex64], n: usize) {
         for column in 0..row - 1 {
             h[idx(n, row, column)] = zero();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::arr2;
-
-    fn conjugate_transpose(matrix: &Array2<Complex64>) -> Array2<Complex64> {
-        matrix.t().map(|value| value.conj()).to_owned()
-    }
-
-    fn max_abs_diff(left: &Array2<Complex64>, right: &Array2<Complex64>) -> f64 {
-        left.iter()
-            .zip(right.iter())
-            .map(|(l, r)| (*l - *r).norm())
-            .fold(0.0, f64::max)
-    }
-
-    #[test]
-    fn shifted_qr_filter_preserves_similarity_for_small_hessenberg() {
-        let h = arr2(&[
-            [
-                Complex64::new(2.0, 0.1),
-                Complex64::new(1.0, -0.3),
-                Complex64::new(0.2, 0.4),
-            ],
-            [
-                Complex64::new(0.7, 0.0),
-                Complex64::new(1.0, -0.2),
-                Complex64::new(-0.5, 0.1),
-            ],
-            [
-                Complex64::ZERO,
-                Complex64::new(0.4, 0.0),
-                Complex64::new(-1.0, 0.5),
-            ],
-        ]);
-        let shifts = [Complex64::new(0.25, -0.4), Complex64::new(-0.1, 0.2)];
-
-        let (q, filtered_h) = shifted_qr_filter(&h, &shifts).unwrap();
-        let reconstructed = q.dot(&filtered_h).dot(&conjugate_transpose(&q));
-
-        assert!(max_abs_diff(&h, &reconstructed) <= 1.0e-8);
     }
 }

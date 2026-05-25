@@ -10,6 +10,7 @@ use num_complex::Complex64;
 
 use crate::backend::Backend;
 use crate::error::IramError;
+use crate::linalg::ops::{normalize, nrm2, orthogonalize_against_backend_basis};
 use crate::operator::LinearOperator;
 
 /// Маленькая верхнехессенбергова матрица в column-major раскладке.
@@ -100,7 +101,7 @@ pub fn run_arnoldi<B: Backend>(
     }
 
     let mut normalized_start = start_vector.to_vec();
-    backend.normalize(&mut normalized_start, "Arnoldi start vector")?;
+    normalize(&mut normalized_start, "Arnoldi start vector")?;
 
     let mut basis = backend.alloc_basis(dim, steps + 1)?;
     backend.write_basis_column(&mut basis, 0, &normalized_start);
@@ -158,14 +159,15 @@ pub fn continue_arnoldi<B: Backend>(
             &mut candidate_vec,
             &mut candidate_host,
         )?;
-        let candidate_old = backend.nrm2(&candidate_host);
+        let candidate_old = nrm2(&candidate_host);
         *matvec_count += 1;
 
         for value in h_column[..=step].iter_mut() {
             *value = Complex64::ZERO;
         }
 
-        let orthogonalized = backend.orthogonalize_against_basis(
+        let orthogonalized = orthogonalize_against_backend_basis(
+            backend,
             &basis,
             step + 1,
             &mut candidate_host,

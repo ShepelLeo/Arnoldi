@@ -1,11 +1,9 @@
 //! Абстракция бэкенда для общего ядра IRAM/Arnoldi.
 //!
-//! Бэкенд предоставляет ядру только базовые численные примитивы: ортогональные
-//! операции над собственным базисом Крылова, плотный/разрежённый matvec и
-//! matmul, malloc-style управление крупными буферами и обобщённые операции
-//! численной линейной алгебры (multishift QR на маленьком Хессенберге,
-//! спектральная задача на малом плотном блоке). Ничего специфичного для
-//! IRAM/Арнольди здесь нет.
+//! Бэкенд предоставляет ядру только базовые численные примитивы и владение
+//! крупными буферами (базис Крылова, вектор-кандидат). Ничего о шагах
+//! Арнольди, ортогонализации, рестартах, Ритц-парах бэкенд не знает —
+//! всё это решает ядро.
 //!
 //! Все матричные данные передаются в виде непрерывных срезов `&[Complex64]`
 //! column-major + явное `ld`. Векторы — простые срезы `&[Complex64]`. Никакой
@@ -14,7 +12,7 @@
 use num_complex::Complex64;
 
 use crate::error::IramError;
-use crate::linalg::ops::{OrthogonalizedVector, Trans};
+use crate::linalg::ops::Trans;
 use crate::operator::LinearOperator;
 
 pub mod lapack;
@@ -25,9 +23,8 @@ pub use lapack::LapackBackend;
 #[cfg(feature = "magma")]
 pub use magma::MagmaBackend;
 
-/// Опционная плотная матрица (column-major). Используется только для
-/// возвращаемых ядру результатов фиксированно небольшой размерности
-/// (n×n или n×k, где n = `ncv`).
+/// Плотная матрица в column-major раскладке. Используется для маленьких
+/// `n×n`/`n×k` блоков, передаваемых между ядром и бэкендом.
 pub struct DenseColMajor {
     pub data: Vec<Complex64>,
     pub rows: usize,
@@ -80,8 +77,9 @@ pub struct SmallEig {
     pub dim: usize,
 }
 
-/// Универсальная абстракция бэкенда. Содержит только независимые от алгоритма
-/// примитивы.
+/// Абстракция бэкенда. Только владение крупными буферами + generic numerical
+/// primitives. Никаких высокоуровневых алгоритмических методов (CGS,
+/// `arnoldi_step`, восстановление Ритца) здесь нет — это ответственность ядра.
 pub trait Backend {
     /// Дескриптор оператора, подготовленный для быстрого matvec
     /// (например, CSR-копия на устройстве).
@@ -142,8 +140,10 @@ pub trait Backend {
 
     // ---------- Разрежённый matvec ----------
 
-    /// y = A * x, где A — подготовленный оператор. `x` — столбец `column`
-    /// базиса, `y` — результат, размещаемый в `out_vector` (GPU/CPU).
+    /// `y = A * x`, где `A` — подготовленный оператор. `x` — столбец `column`
+    /// базиса, `y` — результат, размещаемый в `out_vector` (GPU/CPU). Зеркало
+    /// `out_host_mirror` синхронно обновляется, чтобы ядро могло считать
+    /// норму на host без отдельной D2H-копии.
     fn spmv_basis_column(
         &mut self,
         operator: &mut Self::OperatorHandle,
@@ -154,64 +154,43 @@ pub trait Backend {
         out_host_mirror: &mut [Complex64],
     ) -> Result<(), IramError>;
 
-    // ---------- Векторные примитивы (без участия base) ----------
+    // ---------- Низкоуровневые vector ops над VectorHandle ----------
 
-    /// 2-норма host-среза.
-    fn nrm2(&mut self, vector: &[Complex64]) -> f64 {
-        crate::linalg::ops::nrm2(vector)
-    }
+    /// `||v||_2` — 2-норма device/host вектора.
+    fn vector_nrm2(&mut self, vector: &Self::VectorHandle) -> f64;
 
-    /// x *= alpha (host).
-    fn scal(&mut self, vector: &mut [Complex64], alpha: Complex64) {
-        crate::linalg::ops::scal(vector, alpha);
-    }
+    /// `v *= alpha` — масштабирование device/host вектора in-place.
+    fn vector_scale(&mut self, vector: &mut Self::VectorHandle, alpha: Complex64);
 
-    /// y += alpha * x (host).
-    fn axpy(&mut self, target: &mut [Complex64], alpha: Complex64, source: &[Complex64]) {
-        crate::linalg::ops::axpy(target, alpha, source);
-    }
+    // ---------- Низкоуровневые basis ops для CGS, реализуемой в ядре ----------
 
-    /// Нормализация host-среза.
-    fn normalize(&mut self, vector: &mut [Complex64], context: &'static str) -> Result<f64, IramError> {
-        crate::linalg::ops::normalize(vector, context)
-    }
-
-    // ---------- Ортогонализация против полей бэкенда ----------
-
-    /// Классический Gram-Schmidt с реортогонализацией.
+    /// `proj := V[:, 0..n]^H * x`, где `V` — первые `n` колонок дескриптора
+    /// `basis`, `x` — `vector`. Результат — host-срез длиной `n`.
     ///
-    /// Базис — это первые `basis_columns` колонок дескриптора `basis`
-    /// (хранимого на стороне бэкенда). На вход — host-копия кандидата
-    /// (`candidate_host`) и его же копия на стороне бэкенда (`candidate_vec`).
-    /// Бэкенд обновляет оба, а также накапливает поправки в `h_column`
-    /// (host-срез, длина = `basis_columns`).
-    fn orthogonalize_against_basis(
+    /// Это основной primitive, на котором ядро строит классический
+    /// Gram-Schmidt: бэкенд знает, на host или GPU лежит базис, но не знает,
+    /// для чего эта проекция нужна алгоритму.
+    fn basis_prefix_conj_dot_vector(
         &mut self,
         basis: &Self::BasisHandle,
         basis_columns: usize,
-        candidate_host: &mut [Complex64],
-        candidate_vec: &mut Self::VectorHandle,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector;
+        vector: &Self::VectorHandle,
+        out_projection: &mut [Complex64],
+    );
 
-    /// Ортогонализация host-вектора против host-матрицы (column-major).
-    /// Используется в логике рестарта против уже повернутого базиса.
-    fn orthogonalize_against_host_basis(
+    /// `x -= V[:, 0..n] * proj`, где `V` — первые `n` колонок `basis`,
+    /// `x` — `vector`, `proj` — host-срез длиной `n`.
+    fn basis_prefix_sub_mul(
         &mut self,
-        residual: &mut [Complex64],
-        basis: &[Complex64],
-        basis_rows: usize,
+        basis: &Self::BasisHandle,
         basis_columns: usize,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector;
+        projection: &[Complex64],
+        vector: &mut Self::VectorHandle,
+    );
 
     // ---------- Плотные операции на маленьких матрицах ----------
 
-    /// C = op(A) * op(B). Все матрицы — column-major, host-стороны.
+    /// `C = op(A) * op(B)`. Все матрицы — column-major, host-стороны.
     fn gemm(
         &mut self,
         trans_a: Trans,
@@ -229,7 +208,7 @@ pub trait Backend {
 
     /// Multishift QR / Schur-like primitive: применяет неявный шифтованный QR к
     /// маленькой верхнехессенберговой `n×n` матрице, накапливает унитарное
-    /// преобразование `Q`. Это обобщённый numerical-LA примитив; алгоритм
+    /// преобразование `Q`. Обобщённый numerical-LA примитив; алгоритм
     /// рестарта дальше сам разбирает результат.
     fn multishift_qr_filter(
         &mut self,

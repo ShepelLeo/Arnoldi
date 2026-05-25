@@ -9,7 +9,7 @@ use crate::arnoldi::{ArnoldiFactorization, HessenbergMatrix, continue_arnoldi, r
 use crate::backend::{Backend, DenseColMajor, LapackBackend};
 use crate::config::SolverConfig;
 use crate::error::IramError;
-use crate::linalg::ops::Trans;
+use crate::linalg::ops::{Trans, axpy, normalize, orthogonalize_against_host_basis_slice};
 use crate::memory;
 use crate::operator::LinearOperator;
 use crate::report::{IterationLog, RitzEstimate, SolveReport};
@@ -37,7 +37,7 @@ pub fn solve_with_backend<B: Backend>(
     config.validate(operator.dimension())?;
 
     let mut current_start = start_vector;
-    backend.normalize(&mut current_start, "solver start vector")?;
+    normalize(&mut current_start, "solver start vector")?;
 
     let mut operator_handle = backend.prepare_operator(operator)?;
     let mut total_matvecs = 0usize;
@@ -260,13 +260,14 @@ fn implicit_restart_and_extend<B: Backend>(
     }
     let mut v_m = vec![Complex64::ZERO; dim];
     backend.read_basis_column(&factorization.basis, m, &mut v_m);
-    backend.axpy(&mut residual, residual_coupling, &v_m);
+    axpy(&mut residual, residual_coupling, &v_m);
 
     let residual_reference_norm = (h_coupling.norm_sqr() + residual_coupling.norm_sqr()).sqrt();
     let mut h_column_correction = vec![Complex64::ZERO; k];
 
     // Ортогонализация против rotated_basis (k столбцов, dim×k) — host-сторона.
-    let orthogonalized = backend.orthogonalize_against_host_basis(
+    // CGS+reortho живёт в ядре (`linalg::ops`); бэкенд здесь не участвует.
+    let orthogonalized = orthogonalize_against_host_basis_slice(
         &mut residual,
         &rotated_block[..dim * k],
         dim,

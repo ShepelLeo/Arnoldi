@@ -1,8 +1,6 @@
-//! MAGMA / cuSPARSE-бэкенд для нового generic-API.
-//!
-//! Базис Крылова, текущий кандидат и проекция владеются устройством через
-//! `DeviceMatrix` / `DeviceVector`. Ядро работает только со срезами на хосте;
-//! бэкенд сам синхронизирует device-зеркало.
+//! MAGMA / cuSPARSE-бэкенд: владение device-резидентным базисом + generic
+//! primitives. Никакой алгоритмической логики (CGS, Арнольди, рестарт) здесь
+//! нет — её предоставляет ядро.
 
 use num_complex::Complex64;
 
@@ -13,10 +11,7 @@ use crate::linalg::magma::{
     ZgemvTranspose as MagmaZgemvTranspose, zgemm_with_session_slice,
     zgeev_right_eigenpairs_slice,
 };
-use crate::linalg::ops::{
-    OrthogonalizedVector, REORTHOGONALIZATION_THRESHOLD, Trans, is_numerical_breakdown, nrm2,
-    scal,
-};
+use crate::linalg::ops::{Trans, nrm2, scal};
 use crate::linalg::shifted_qr::shifted_qr_filter_slice;
 use crate::operator::LinearOperator;
 
@@ -58,159 +53,6 @@ fn trans_to_zgemm(trans: Trans) -> ZgemmTranspose {
         Trans::ConjugateTranspose => ZgemmTranspose::ConjugateTranspose,
     }
 }
-
-/// CGS + однократная реортогонализация. Базис — устройство, кандидат — пара
-/// (host, device).
-fn orthogonalize_against_device_basis(
-    session: &MagmaSession,
-    d_basis: &DeviceMatrix,
-    basis_columns: usize,
-    candidate_host: &mut [Complex64],
-    d_candidate: &mut DeviceVector,
-    d_projection: &mut DeviceVector,
-    projection_host: &mut [Complex64],
-    h_column: &mut [Complex64],
-    reference_norm: f64,
-    breakdown_tol: f64,
-) -> OrthogonalizedVector {
-    let m = d_basis.rows();
-    let n = basis_columns;
-    debug_assert!(n <= d_basis.columns());
-    debug_assert_eq!(candidate_host.len(), m);
-    debug_assert_eq!(d_candidate.len(), m);
-    debug_assert!(d_projection.len() >= n);
-    debug_assert!(projection_host.len() >= n);
-    debug_assert!(h_column.len() >= n);
-
-    let one = Complex64::new(1.0, 0.0);
-    let zero = Complex64::ZERO;
-    let minus_one = Complex64::new(-1.0, 0.0);
-    let projection_host = &mut projection_host[..n];
-
-    for _ in 0..2 {
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::ConjugateTranspose,
-            one,
-            d_candidate,
-            zero,
-            d_projection,
-        );
-        d_projection.copy_prefix_to_slice(session, projection_host);
-
-        for (h, &p) in h_column.iter_mut().zip(projection_host.iter()) {
-            *h += p;
-        }
-
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::None,
-            minus_one,
-            d_projection,
-            one,
-            d_candidate,
-        );
-    }
-
-    d_candidate.copy_to_slice(session, candidate_host);
-
-    let mut residual_norm = nrm2(candidate_host);
-    if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-        return OrthogonalizedVector {
-            residual_norm,
-            happy_breakdown: true,
-        };
-    }
-
-    scal(candidate_host, Complex64::new(1.0 / residual_norm, 0.0));
-    d_candidate.copy_from_slice(session, candidate_host);
-
-    d_basis.zgemv_leading_columns(
-        session,
-        n,
-        MagmaZgemvTranspose::ConjugateTranspose,
-        one,
-        d_candidate,
-        zero,
-        d_projection,
-    );
-    d_projection.copy_prefix_to_slice(session, projection_host);
-
-    let correction_norm = nrm2(projection_host);
-
-    if correction_norm > REORTHOGONALIZATION_THRESHOLD {
-        for (h, &p) in h_column.iter_mut().zip(projection_host.iter()) {
-            *h += p * Complex64::new(residual_norm, 0.0);
-        }
-
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::None,
-            minus_one,
-            d_projection,
-            one,
-            d_candidate,
-        );
-        d_candidate.copy_to_slice(session, candidate_host);
-
-        let reorthogonalized_norm = nrm2(candidate_host);
-        residual_norm *= reorthogonalized_norm;
-        if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-            return OrthogonalizedVector {
-                residual_norm,
-                happy_breakdown: true,
-            };
-        }
-        scal(candidate_host, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
-        d_candidate.copy_from_slice(session, candidate_host);
-    }
-
-    OrthogonalizedVector {
-        residual_norm,
-        happy_breakdown: false,
-    }
-}
-
-/// CGS + реортогонализация для host-базиса (используется на рестарте). Сначала
-/// host -> device загрузка, потом то же ядро.
-fn orthogonalize_against_host_basis_via_magma(
-    session: &MagmaSession,
-    candidate_host: &mut [Complex64],
-    basis_host: &[Complex64],
-    basis_rows: usize,
-    basis_columns: usize,
-    h_column: &mut [Complex64],
-    reference_norm: f64,
-    breakdown_tol: f64,
-) -> OrthogonalizedVector {
-    debug_assert_eq!(candidate_host.len(), basis_rows);
-    debug_assert!(basis_host.len() >= basis_rows * basis_columns);
-    debug_assert!(h_column.len() >= basis_columns);
-
-    let mut d_basis = DeviceMatrix::new(basis_rows, basis_columns);
-    d_basis.copy_from_host_slice(session, basis_host, basis_rows);
-
-    let mut d_candidate = DeviceVector::from_slice(session, candidate_host);
-    let mut d_projection = DeviceVector::new(basis_columns);
-    let mut projection_host = vec![Complex64::ZERO; basis_columns];
-
-    orthogonalize_against_device_basis(
-        session,
-        &d_basis,
-        basis_columns,
-        candidate_host,
-        &mut d_candidate,
-        &mut d_projection,
-        &mut projection_host,
-        h_column,
-        reference_norm,
-        breakdown_tol,
-    )
-}
-
 
 impl Backend for MagmaBackend {
     type OperatorHandle = MagmaOperatorHandle;
@@ -314,56 +156,72 @@ impl Backend for MagmaBackend {
         Ok(())
     }
 
-    fn orthogonalize_against_basis(
+    fn vector_nrm2(&mut self, vector: &Self::VectorHandle) -> f64 {
+        // MAGMA не экспортирует `magma_dznrm2` в текущей биндинг-сборке.
+        // Делаем D2H в локальный буфер и считаем норму на host.
+        let len = vector.d_vector.len();
+        let mut mirror = vec![Complex64::ZERO; len];
+        vector.d_vector.copy_to_slice(&self.session, &mut mirror);
+        nrm2(&mirror)
+    }
+
+    fn vector_scale(&mut self, vector: &mut Self::VectorHandle, alpha: Complex64) {
+        // Аналогично: D2H → host-scal → H2D.
+        let len = vector.d_vector.len();
+        let mut mirror = vec![Complex64::ZERO; len];
+        vector.d_vector.copy_to_slice(&self.session, &mut mirror);
+        scal(&mut mirror, alpha);
+        vector.d_vector.copy_from_slice(&self.session, &mirror);
+    }
+
+    fn basis_prefix_conj_dot_vector(
         &mut self,
         basis: &Self::BasisHandle,
         basis_columns: usize,
-        candidate_host: &mut [Complex64],
-        candidate_vec: &mut Self::VectorHandle,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector {
-        // Прокидываем рабочие буферы basis (d_projection, projection_host)
-        // через unsafe-окно: мы не можем мутировать `basis: &Self::BasisHandle`,
-        // поэтому держим отдельные временные буферы.
+        vector: &Self::VectorHandle,
+        out_projection: &mut [Complex64],
+    ) {
+        debug_assert!(basis_columns <= basis.capacity);
+        debug_assert!(out_projection.len() >= basis_columns);
+        if basis_columns == 0 {
+            return;
+        }
         let mut d_projection = DeviceVector::new(basis_columns);
-        let mut projection_host = vec![Complex64::ZERO; basis_columns];
-
-        orthogonalize_against_device_basis(
+        basis.d_basis.zgemv_leading_columns(
             &self.session,
-            &basis.d_basis,
             basis_columns,
-            candidate_host,
-            &mut candidate_vec.d_vector,
+            MagmaZgemvTranspose::ConjugateTranspose,
+            Complex64::new(1.0, 0.0),
+            &vector.d_vector,
+            Complex64::ZERO,
             &mut d_projection,
-            &mut projection_host,
-            h_column,
-            reference_norm,
-            breakdown_tol,
-        )
+        );
+        d_projection.copy_prefix_to_slice(&self.session, &mut out_projection[..basis_columns]);
     }
 
-    fn orthogonalize_against_host_basis(
+    fn basis_prefix_sub_mul(
         &mut self,
-        residual: &mut [Complex64],
-        basis: &[Complex64],
-        basis_rows: usize,
+        basis: &Self::BasisHandle,
         basis_columns: usize,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector {
-        orthogonalize_against_host_basis_via_magma(
+        projection: &[Complex64],
+        vector: &mut Self::VectorHandle,
+    ) {
+        debug_assert!(basis_columns <= basis.capacity);
+        debug_assert!(projection.len() >= basis_columns);
+        if basis_columns == 0 {
+            return;
+        }
+        let mut d_projection = DeviceVector::new(basis_columns);
+        d_projection.copy_prefix_from_slice(&self.session, &projection[..basis_columns]);
+        basis.d_basis.zgemv_leading_columns(
             &self.session,
-            residual,
-            basis,
-            basis_rows,
             basis_columns,
-            h_column,
-            reference_norm,
-            breakdown_tol,
-        )
+            MagmaZgemvTranspose::None,
+            Complex64::new(-1.0, 0.0),
+            &d_projection,
+            Complex64::new(1.0, 0.0),
+            &mut vector.d_vector,
+        );
     }
 
     fn gemm(
@@ -436,7 +294,6 @@ impl Backend for MagmaBackend {
         let schur = zgeev_right_eigenpairs_slice(&matrix.data, n).map_err(|error| {
             IramError::Spectral(format!("magma_zgeev failed: {error:?}"))
         })?;
-        // У zgeev собственные векторы уже лежат в `schur.z`, column-major dim×dim.
         Ok(SmallEig {
             values: schur.w,
             vectors: schur.z,
@@ -444,4 +301,3 @@ impl Backend for MagmaBackend {
         })
     }
 }
-

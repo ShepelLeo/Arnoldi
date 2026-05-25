@@ -1,25 +1,22 @@
-//! LAPACK/OpenBLAS-бэкенд для нового generic-API.
+//! LAPACK/OpenBLAS-бэкенд: владение базисом/вектором + generic primitives.
 //!
-//! Реализация прокидывает примитивы Backend в существующие FFI-обёртки в
-//! `linalg/lapack.rs` и `linalg/shifted_qr.rs`. Базис Крылова хранится здесь
-//! как обычный `Vec<Complex64>` column-major с шагом `ld = dimension`. Это и
-//! есть "владение крупным буфером на стороне бэкенда" для CPU-варианта.
+//! Никакой алгоритмической логики (CGS, Arnoldi step, рестарт) здесь нет —
+//! всё это живёт в ядре. Бэкенд только знает, как хранить базис в host-памяти
+//! column-major и как вызвать BLAS/LAPACK для запрошенных примитивов.
 
 use num_complex::Complex64;
 
 use crate::backend::{Backend, DenseColMajor, SmallEig};
 use crate::error::IramError;
 use crate::linalg::lapack::{
-    ZgemmTranspose, zgemm_slice, zhseqr_schur_slice, ztrevc_all_right_slice,
+    ZgemmTranspose, ZgemvTranspose, zgemm_slice, zgemv_slice, zhseqr_schur_slice,
+    ztrevc_all_right_slice,
 };
-use crate::linalg::ops::{
-    OrthogonalizedVector, Trans, orthogonalize_against_host_basis_slice,
-};
+use crate::linalg::ops::{Trans, nrm2, scal};
 use crate::linalg::shifted_qr::shifted_qr_filter_slice;
 use crate::operator::LinearOperator;
 
-/// CPU-вариант хранилища базиса. Поле `data` имеет длину `rows * capacity`
-/// и хранится column-major; `ld == rows`.
+/// CPU-вариант хранилища базиса. `data` хранится column-major, `ld = rows`.
 pub struct HostBasis {
     data: Vec<Complex64>,
     rows: usize,
@@ -142,56 +139,59 @@ impl Backend for LapackBackend {
         out_vector: &mut Self::VectorHandle,
         out_host_mirror: &mut [Complex64],
     ) -> Result<(), IramError> {
-        let source = basis.column(column);
-        operator_obj.apply(source, out_host_mirror)?;
-        // Поддерживаем host-mirror и device-handle в синхронном состоянии
-        // (для CPU это одна и та же память, но трейту нужно явное обновление).
+        operator_obj.apply(basis.column(column), out_host_mirror)?;
         out_vector.data.copy_from_slice(out_host_mirror);
         Ok(())
     }
 
-    fn orthogonalize_against_basis(
+    fn vector_nrm2(&mut self, vector: &Self::VectorHandle) -> f64 {
+        nrm2(&vector.data)
+    }
+
+    fn vector_scale(&mut self, vector: &mut Self::VectorHandle, alpha: Complex64) {
+        scal(&mut vector.data, alpha);
+    }
+
+    fn basis_prefix_conj_dot_vector(
         &mut self,
         basis: &Self::BasisHandle,
         basis_columns: usize,
-        candidate_host: &mut [Complex64],
-        candidate_vec: &mut Self::VectorHandle,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector {
-        let result = orthogonalize_against_host_basis_slice(
-            candidate_host,
-            &basis.data,
+        vector: &Self::VectorHandle,
+        out_projection: &mut [Complex64],
+    ) {
+        debug_assert!(out_projection.len() >= basis_columns);
+        zgemv_slice(
+            ZgemvTranspose::ConjugateTranspose,
             basis.rows,
             basis_columns,
-            h_column,
-            reference_norm,
-            breakdown_tol,
+            Complex64::new(1.0, 0.0),
+            &basis.data,
+            basis.rows.max(1),
+            &vector.data,
+            Complex64::ZERO,
+            &mut out_projection[..basis_columns],
         );
-        candidate_vec.data.copy_from_slice(candidate_host);
-        result
     }
 
-    fn orthogonalize_against_host_basis(
+    fn basis_prefix_sub_mul(
         &mut self,
-        residual: &mut [Complex64],
-        basis: &[Complex64],
-        basis_rows: usize,
+        basis: &Self::BasisHandle,
         basis_columns: usize,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector {
-        orthogonalize_against_host_basis_slice(
-            residual,
-            basis,
-            basis_rows,
+        projection: &[Complex64],
+        vector: &mut Self::VectorHandle,
+    ) {
+        debug_assert!(projection.len() >= basis_columns);
+        zgemv_slice(
+            ZgemvTranspose::None,
+            basis.rows,
             basis_columns,
-            h_column,
-            reference_norm,
-            breakdown_tol,
-        )
+            Complex64::new(-1.0, 0.0),
+            &basis.data,
+            basis.rows.max(1),
+            &projection[..basis_columns],
+            Complex64::new(1.0, 0.0),
+            &mut vector.data,
+        );
     }
 
     fn gemm(
@@ -268,4 +268,3 @@ impl Backend for LapackBackend {
         })
     }
 }
-

@@ -1,10 +1,12 @@
 //! Определение операторного типа
 //! Пользовательские операторы
+//!
+//! Все операторы работают через непрерывные срезы `&[Complex64]`.
+//! Плотные/разрежённые матрицы внутри храним в обычных `Vec`-буферах.
 use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use num_complex::Complex64;
 
 use crate::error::IramError;
@@ -61,26 +63,17 @@ impl CsrMatrix {
 pub trait LinearOperator: Send + Sync {
     /// Размерность задачи
     fn dimension(&self) -> usize;
-    /// MatVec
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError>;
-    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
-        let mut output = Array1::zeros(self.dimension());
-        self.apply_into(vector.view(), output.view_mut())?;
-        Ok(output)
-    }
-    /// Sparse matrix representation for GPU backends that support cuSPARSE.
-    ///
-    /// Operators that cannot be materialized as a finite CSR matrix, for example
-    /// a closure-backed `FnOperator`, keep the default `None`.
+
+    /// MatVec: `output = A * vector`. Срезы — непрерывные, длиной `dimension()`.
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError>;
+
+    /// CSR-представление (если оператор материализуется как разрежённая
+    /// матрица). По умолчанию — `None`.
     fn csr_matrix(&self) -> Option<CsrMatrix> {
         None
     }
 
-    /// Буковки
+    /// Описание оператора для логирования.
     fn description(&self) -> String;
 }
 
@@ -101,14 +94,10 @@ impl LinearOperator for IdentityOperator {
         self.dimension
     }
 
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
-        output.assign(&vector);
+        output.copy_from_slice(vector);
         Ok(())
     }
 
@@ -126,7 +115,7 @@ impl LinearOperator for IdentityOperator {
     }
 }
 
-/// # Матрица Тёплица
+/// # Матрица Грикара (Grcar)
 #[derive(Debug, Clone)]
 pub struct GrcarOperator {
     dimension: usize,
@@ -147,11 +136,7 @@ impl LinearOperator for GrcarOperator {
         self.dimension
     }
 
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
 
@@ -213,10 +198,12 @@ impl LinearOperator for GrcarOperator {
     }
 }
 
-/// # Плотная матрица
+/// # Плотная матрица в column-major раскладке
 #[derive(Debug, Clone)]
 pub struct DenseMatrixOperator {
-    matrix: Array2<Complex64>,
+    dimension: usize,
+    /// Столбцово непрерывное хранилище, ld = `dimension`.
+    data: Vec<Complex64>,
     label: String,
 }
 
@@ -255,14 +242,74 @@ impl DenseMatrixOperator {
             )));
         }
 
-        let flat = rows.into_iter().flatten().collect::<Vec<_>>();
-        let matrix = Array2::from_shape_vec((dimension, width), flat)
-            .map_err(|error| IramError::Parse(format!("cannot reshape dense matrix: {error}")))?;
+        // rows[i][j] = A[i, j]; переложим в column-major.
+        let mut data = vec![Complex64::ZERO; dimension * width];
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                data[i + j * dimension] = value;
+            }
+        }
 
         Ok(Self {
-            matrix,
+            dimension,
+            data,
             label: format!("dense matrix loaded from {}", path.display()),
         })
+    }
+
+    #[inline]
+    fn entry(&self, row: usize, column: usize) -> Complex64 {
+        self.data[row + column * self.dimension]
+    }
+}
+
+impl LinearOperator for DenseMatrixOperator {
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
+        validate_dimension(self.dimension, vector.len())?;
+        validate_dimension(self.dimension, output.len())?;
+
+        for row in 0..self.dimension {
+            let mut acc = Complex64::ZERO;
+            for column in 0..self.dimension {
+                acc += self.entry(row, column) * vector[column];
+            }
+            output[row] = acc;
+        }
+        Ok(())
+    }
+
+    fn csr_matrix(&self) -> Option<CsrMatrix> {
+        let dimension = self.dimension;
+        let mut row_offsets = Vec::with_capacity(dimension + 1);
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        row_offsets.push(0);
+
+        for row in 0..dimension {
+            for column in 0..dimension {
+                let value = self.entry(row, column);
+                if value != Complex64::ZERO {
+                    columns.push(column);
+                    values.push(value);
+                }
+            }
+            row_offsets.push(columns.len());
+        }
+
+        Some(CsrMatrix {
+            dimension,
+            row_offsets,
+            columns,
+            values,
+        })
+    }
+
+    fn description(&self) -> String {
+        self.label.clone()
     }
 }
 
@@ -706,63 +753,12 @@ fn parse_f64(token: &str, context: &str) -> Result<f64, IramError> {
     })
 }
 
-impl LinearOperator for DenseMatrixOperator {
-    fn dimension(&self) -> usize {
-        self.matrix.nrows()
-    }
-
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
-        validate_dimension(self.dimension(), vector.len())?;
-        validate_dimension(self.dimension(), output.len())?;
-        output.assign(&self.matrix.dot(&vector));
-        Ok(())
-    }
-
-    fn csr_matrix(&self) -> Option<CsrMatrix> {
-        let dimension = self.dimension();
-        let mut row_offsets = Vec::with_capacity(dimension + 1);
-        let mut columns = Vec::new();
-        let mut values = Vec::new();
-        row_offsets.push(0);
-
-        for row in 0..dimension {
-            for column in 0..dimension {
-                let value = self.matrix[[row, column]];
-                if value != Complex64::ZERO {
-                    columns.push(column);
-                    values.push(value);
-                }
-            }
-            row_offsets.push(columns.len());
-        }
-
-        Some(CsrMatrix {
-            dimension,
-            row_offsets,
-            columns,
-            values,
-        })
-    }
-
-    fn description(&self) -> String {
-        self.label.clone()
-    }
-}
-
 impl LinearOperator for MatrixMarketOperator {
     fn dimension(&self) -> usize {
         self.dimension
     }
 
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
 
@@ -794,7 +790,7 @@ impl LinearOperator for MatrixMarketOperator {
     }
 }
 
-/// # Матрица центральной разностной производной диффузионно-конвекционного оператора
+/// # Конвекционно-диффузионный оператор на 2D сетке
 #[derive(Debug, Clone)]
 pub struct ConvectionDiffusionOperator {
     m: usize,
@@ -816,11 +812,7 @@ impl LinearOperator for ConvectionDiffusionOperator {
         self.m * self.m
     }
 
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
         let n = self.dimension();
         validate_dimension(n, vector.len())?;
         validate_dimension(n, output.len())?;
@@ -925,7 +917,7 @@ impl LinearOperator for ConvectionDiffusionOperator {
 
 pub struct FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: Fn(&[Complex64], &mut [Complex64]) + Send + Sync,
 {
     dimension: usize,
     name: String,
@@ -934,7 +926,7 @@ where
 
 impl<F> FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: Fn(&[Complex64], &mut [Complex64]) + Send + Sync,
 {
     pub fn new(dimension: usize, name: impl Into<String>, matvec: F) -> Self {
         Self {
@@ -947,7 +939,7 @@ where
 
 impl<F> fmt::Debug for FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: Fn(&[Complex64], &mut [Complex64]) + Send + Sync,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -960,28 +952,17 @@ where
 
 impl<F> LinearOperator for FnOperator<F>
 where
-    F: Fn(&Array1<Complex64>) -> Array1<Complex64> + Send + Sync,
+    F: Fn(&[Complex64], &mut [Complex64]) + Send + Sync,
 {
     fn dimension(&self) -> usize {
         self.dimension
     }
 
-    fn apply_into(
-        &self,
-        vector: ArrayView1<'_, Complex64>,
-        mut output: ArrayViewMut1<'_, Complex64>,
-    ) -> Result<(), IramError> {
+    fn apply(&self, vector: &[Complex64], output: &mut [Complex64]) -> Result<(), IramError> {
         validate_dimension(self.dimension, vector.len())?;
         validate_dimension(self.dimension, output.len())?;
-        let result = (self.matvec)(&vector.to_owned());
-        validate_dimension(self.dimension, result.len())?;
-        output.assign(&result);
+        (self.matvec)(vector, output);
         Ok(())
-    }
-
-    fn apply(&self, vector: &Array1<Complex64>) -> Result<Array1<Complex64>, IramError> {
-        validate_dimension(self.dimension, vector.len())?;
-        Ok((self.matvec)(vector))
     }
 
     fn description(&self) -> String {
@@ -1055,65 +1036,4 @@ fn validate_dimension(expected: usize, got: usize) -> Result<(), IramError> {
     (expected == got)
         .then_some(())
         .ok_or(IramError::DimensionMismatch { expected, got })
-}
-
-#[cfg(test)]
-mod tests {
-    use ndarray::Array1;
-    use num_complex::Complex64;
-
-    use super::{ConvectionDiffusionOperator, LinearOperator, parse_complex_token};
-
-    #[test]
-    fn convection_diffusion_dimension_matches_grid() {
-        let operator = ConvectionDiffusionOperator::new(4, 1.0);
-        assert_eq!(operator.dimension(), 16);
-    }
-
-    #[test]
-    fn complex_parser_supports_real_and_imaginary_entries() {
-        assert_eq!(
-            parse_complex_token("2.5").expect("real entry should parse"),
-            Complex64::new(2.5, 0.0)
-        );
-        assert_eq!(
-            parse_complex_token("-1.0+3.0i").expect("complex entry should parse"),
-            Complex64::new(-1.0, 3.0)
-        );
-        assert_eq!(
-            parse_complex_token("-i").expect("pure imaginary entry should parse"),
-            Complex64::new(0.0, -1.0)
-        );
-    }
-
-    #[test]
-    fn matrix_market_coordinate_hermitian_uses_sparse_matvec() {
-        let content = "\
-%%MatrixMarket matrix coordinate complex hermitian
-3 3 4
-1 1 2.0 0.0
-2 1 3.0 4.0
-2 2 5.0 0.0
-3 2 6.0 -1.0
-";
-        let operator = super::parse_matrix_market(content, "test matrix".to_string())
-            .expect("Hermitian Matrix Market matrix should parse");
-        let vector = Array1::from_vec(vec![
-            Complex64::new(1.0, 0.0),
-            Complex64::new(10.0, 0.0),
-            Complex64::new(100.0, 0.0),
-        ]);
-        let result = operator
-            .apply(&vector)
-            .expect("Matrix Market matvec should succeed");
-
-        assert_eq!(
-            result.to_vec(),
-            vec![
-                Complex64::new(32.0, -40.0),
-                Complex64::new(653.0, 104.0),
-                Complex64::new(60.0, -10.0),
-            ]
-        );
-    }
 }

@@ -16,7 +16,6 @@ use complex_iram::operator::{
 use complex_iram::{IramError, LapackBackend, solve_with_backend};
 #[cfg(feature = "magma")]
 use complex_iram::MagmaBackend;
-use ndarray::Array1;
 use num_complex::Complex64;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -212,10 +211,10 @@ fn build_start_vector(
     cli: &Cli,
     dimension: usize,
     rng: &mut StdRng,
-) -> Result<(Array1<Complex64>, String), IramError> {
+) -> Result<(Vec<Complex64>, String), IramError> {
     if let Some(path) = &cli.start_vector {
         let content = fs::read_to_string(path)?;
-        let entries = content
+        let mut entries = content
             .split_whitespace()
             .map(parse_complex_token)
             .collect::<Result<Vec<_>, _>>()?;
@@ -227,9 +226,8 @@ fn build_start_vector(
             });
         }
 
-        let mut vector = Array1::from_vec(entries);
-        normalize(&mut vector, "user-supplied start vector")?;
-        return Ok((vector, format!("loaded from {}", path.display())));
+        normalize(&mut entries, "user-supplied start vector")?;
+        return Ok((entries, format!("loaded from {}", path.display())));
     }
 
     normalized_random_vector(dimension, rng)

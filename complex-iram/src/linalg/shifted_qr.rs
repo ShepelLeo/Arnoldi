@@ -72,6 +72,80 @@ pub fn shifted_qr_filter(
     shifted_qr_filter_with_workspace(hessenberg, shifts, &mut workspace)
 }
 
+/// Slice-based shifted QR filter (column-major in/out).
+///
+/// Возвращает `(Q, H_filtered)` в column-major раскладке как обычные `Vec`-буферы
+/// без `ndarray`. Это generic-примитив для ядра IRAM/Arnoldi.
+pub fn shifted_qr_filter_slice(
+    hessenberg: &[Complex64],
+    n: usize,
+    shifts: &[Complex64],
+) -> Result<(Vec<Complex64>, Vec<Complex64>), String> {
+    if hessenberg.len() != n * n {
+        return Err("H buffer length must be n*n".into());
+    }
+
+    let mut workspace = ShiftedQrWorkspace::new();
+    workspace.resize(n);
+
+    copy_col_major_to_row_major(hessenberg, &mut workspace.h_row_major, n);
+    fill_identity_row_major(&mut workspace.q_row_major, n);
+
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    if !shifts.is_empty() {
+        let safe_threshold = safe_minimum_threshold(n);
+        let h_norm =
+            hessenberg_one_norm_row_major(&workspace.h_row_major, n).max(safe_threshold);
+
+        for (shift_index, shift) in shifts.iter().copied().enumerate() {
+            apply_implicit_shift_row_major(
+                &mut workspace.h_row_major,
+                &mut workspace.q_row_major,
+                n,
+                shift,
+                shift_index,
+                safe_threshold,
+                h_norm,
+            );
+        }
+
+        make_subdiagonal_real_nonnegative_row_major(
+            &mut workspace.h_row_major,
+            &mut workspace.q_row_major,
+            n,
+        );
+        deflate_small_subdiagonals_row_major(
+            &mut workspace.h_row_major,
+            n,
+            safe_threshold,
+            h_norm,
+        );
+    }
+
+    cleanup_hessenberg_roundoff_row_major(&mut workspace.h_row_major, n);
+
+    let mut q_fortran = vec![zero(); n * n];
+    let mut h_fortran = vec![zero(); n * n];
+    copy_row_major_to_fortran(&workspace.q_row_major, &mut q_fortran, n);
+    copy_row_major_to_fortran(&workspace.h_row_major, &mut h_fortran, n);
+
+    Ok((q_fortran, h_fortran))
+}
+
+fn copy_col_major_to_row_major(input: &[Complex64], output: &mut [Complex64], n: usize) {
+    debug_assert_eq!(input.len(), n * n);
+    debug_assert_eq!(output.len(), n * n);
+
+    for column in 0..n {
+        for row in 0..n {
+            output[idx(n, row, column)] = input[row + column * n];
+        }
+    }
+}
+
 /// Workspace-aware shifted QR API.
 ///
 /// Returns `(Q, H_filtered)` in Fortran/column-major ndarray layout.

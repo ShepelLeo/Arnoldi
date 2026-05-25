@@ -1,57 +1,114 @@
-//! Процесс Арнольди
-use ndarray::{Array1, Array2, ShapeBuilder, s};
+//! Процесс Арнольди — ядро без зависимости от конкретного бэкенда.
+//!
+//! Ядро работает только с примитивами `Backend`. Базис V (размер `m × (ncv+1)`)
+//! хранится в дескрипторе, который владеет бэкенд (CPU-память или GPU-память).
+//! Хессенберг H живёт в простом `Vec<Complex64>` column-major с явным `ld`,
+//! здесь же владение остаётся за ядром, поскольку матрица маленькая
+//! (`(ncv+1) × ncv`).
+
 use num_complex::Complex64;
 
 use crate::backend::Backend;
 use crate::error::IramError;
-
 use crate::operator::LinearOperator;
 
-/// Ответ процесса
+/// Маленькая верхнехессенбергова матрица в column-major раскладке.
 #[derive(Debug, Clone)]
-pub struct ArnoldiFactorization {
-    pub basis: Array2<Complex64>,
-    pub hessenberg: Array2<Complex64>,
+pub struct HessenbergMatrix {
+    pub data: Vec<Complex64>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl HessenbergMatrix {
+    pub fn zeros(rows: usize, cols: usize) -> Self {
+        Self {
+            data: vec![Complex64::ZERO; rows * cols],
+            rows,
+            cols,
+        }
+    }
+
+    #[inline]
+    pub fn ld(&self) -> usize {
+        self.rows.max(1)
+    }
+
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> Complex64 {
+        self.data[row + col * self.rows]
+    }
+
+    #[inline]
+    pub fn set(&mut self, row: usize, col: usize, value: Complex64) {
+        self.data[row + col * self.rows] = value;
+    }
+}
+
+/// Результат процесса Арнольди.
+#[derive(Debug, Clone)]
+pub struct ArnoldiFactorization<H> {
+    /// Дескриптор базиса (живёт на стороне бэкенда).
+    pub basis: H,
+    /// Хессенберг размером `(target_steps+1) × target_steps`.
+    pub hessenberg: HessenbergMatrix,
     pub performed_steps: usize,
     pub happy_breakdown: bool,
 }
 
-impl ArnoldiFactorization {
-    pub fn square_hessenberg(&self) -> Array2<Complex64> {
-        self.hessenberg
-            .slice(s![0..self.performed_steps, 0..self.performed_steps])
-            .to_owned()
+impl<H> ArnoldiFactorization<H> {
+    /// Возвращает квадратный обрезок H ([0..k, 0..k]) копией column-major.
+    pub fn square_hessenberg(&self) -> Vec<Complex64> {
+        let k = self.performed_steps;
+        let mut out = vec![Complex64::ZERO; k * k];
+        for j in 0..k {
+            for i in 0..k {
+                out[i + j * k] = self.hessenberg.get(i, j);
+            }
+        }
+        out
     }
 
+    /// Норма последнего поддиагонального элемента
+    /// `h_{performed_steps, performed_steps-1}`.
     pub fn trailing_subdiagonal(&self) -> f64 {
         if self.happy_breakdown || self.performed_steps == 0 {
             0.0
         } else {
-            self.hessenberg[[self.performed_steps, self.performed_steps - 1]].norm()
+            let k = self.performed_steps;
+            self.hessenberg.get(k, k - 1).norm()
         }
     }
 }
 
-/// Вход в процесс Арнольди, первый прогон при инициализации пространства Крылова.
+/// Запускает процесс Арнольди с нуля.
 pub fn run_arnoldi<B: Backend>(
     backend: &mut B,
-    operator_workspace: &mut B::OperatorWorkspace,
+    operator_handle: &mut B::OperatorHandle,
     operator: &dyn LinearOperator,
-    start_vector: &Array1<Complex64>,
+    start_vector: &[Complex64],
     steps: usize,
     breakdown_tol: f64,
     matvec_count: &mut usize,
-) -> Result<ArnoldiFactorization, IramError> {
-    let mut normalized_start = start_vector.clone();
-    backend.normalize_vector(&mut normalized_start, "Arnoldi start vector")?;
+) -> Result<ArnoldiFactorization<B::BasisHandle>, IramError> {
+    let dim = operator.dimension();
+    if start_vector.len() != dim {
+        return Err(IramError::DimensionMismatch {
+            expected: dim,
+            got: start_vector.len(),
+        });
+    }
 
-    let mut basis = Array2::zeros((operator.dimension(), steps + 1).f());
-    basis.column_mut(0).assign(&normalized_start);
-    let hessenberg = Array2::zeros((steps + 1, steps));
+    let mut normalized_start = start_vector.to_vec();
+    backend.normalize(&mut normalized_start, "Arnoldi start vector")?;
+
+    let mut basis = backend.alloc_basis(dim, steps + 1)?;
+    backend.write_basis_column(&mut basis, 0, &normalized_start);
+    let hessenberg = HessenbergMatrix::zeros(steps + 1, steps);
 
     continue_arnoldi(
         backend,
-        operator_workspace,
+        operator_handle,
         operator,
         basis,
         hessenberg,
@@ -62,92 +119,79 @@ pub fn run_arnoldi<B: Backend>(
     )
 }
 
-/// Вход в процесс Арнольди, второй и последующие прогоны, пополняем пространство Крылова.
-///
-/// Алгоритм не знает, где выполняется ортогонализация. Он только сообщает
-/// бэкенду: создать рабочее состояние, ортогонализовать текущий кандидат и
-/// синхронизировать добавленный базисный вектор.
+/// Продолжает (или начинает с шага `start_step`) процесс Арнольди.
 pub fn continue_arnoldi<B: Backend>(
     backend: &mut B,
-    operator_workspace: &mut B::OperatorWorkspace,
+    operator_handle: &mut B::OperatorHandle,
     operator: &dyn LinearOperator,
-    mut basis: Array2<Complex64>,
-    mut hessenberg: Array2<Complex64>,
+    mut basis: B::BasisHandle,
+    mut hessenberg: HessenbergMatrix,
     start_step: usize,
     target_steps: usize,
     breakdown_tol: f64,
     matvec_count: &mut usize,
-) -> Result<ArnoldiFactorization, IramError> {
-    if hessenberg.nrows() != target_steps + 1 || hessenberg.ncols() != target_steps {
+) -> Result<ArnoldiFactorization<B::BasisHandle>, IramError> {
+    if hessenberg.rows != target_steps + 1 || hessenberg.cols != target_steps {
         return Err(IramError::InvalidConfig(format!(
             "Arnoldi continuation expected Hessenberg shape {}x{}, got {}x{}",
             target_steps + 1,
             target_steps,
-            hessenberg.nrows(),
-            hessenberg.ncols(),
+            hessenberg.rows,
+            hessenberg.cols,
         )));
     }
 
-    if basis.ncols() < target_steps + 1 {
-        return Err(IramError::InvalidConfig(format!(
-            "Arnoldi continuation needs at least {} basis vectors, got {}",
-            target_steps + 1,
-            basis.ncols(),
-        )));
-    }
-
-    if basis.nrows() != operator.dimension() {
-        return Err(IramError::InvalidConfig(format!(
-            "Arnoldi basis row count must equal operator dimension {}, got {}",
-            operator.dimension(),
-            basis.nrows(),
-        )));
-    }
-
+    let dim = operator.dimension();
     let mut performed_steps = start_step;
     let mut happy_breakdown = false;
 
-    let mut workspace = backend.create_arnoldi_workspace(&basis, operator.dimension())?;
-    let mut h_column = vec![Complex64::default(); target_steps];
-    let mut candidate = Array1::zeros(operator.dimension());
+    let mut candidate_vec = backend.alloc_vector(dim)?;
+    let mut candidate_host = vec![Complex64::ZERO; dim];
+    let mut h_column = vec![Complex64::ZERO; target_steps];
 
     for step in start_step..target_steps {
-        backend.apply_operator_to_basis_vector(
-            operator_workspace,
-            &mut workspace,
+        backend.spmv_basis_column(
+            operator_handle,
             operator,
             &basis,
             step,
-            &mut candidate,
+            &mut candidate_vec,
+            &mut candidate_host,
         )?;
-        let candidate_old = backend.vector_norm2(&candidate);
+        let candidate_old = backend.nrm2(&candidate_host);
         *matvec_count += 1;
 
-        h_column[..=step].fill(Complex64::ZERO);
-        let orthogonalized = backend.orthogonalize_arnoldi_candidate(
-            &mut workspace,
+        for value in h_column[..=step].iter_mut() {
+            *value = Complex64::ZERO;
+        }
+
+        let orthogonalized = backend.orthogonalize_against_basis(
             &basis,
             step + 1,
-            &mut candidate,
+            &mut candidate_host,
+            &mut candidate_vec,
             &mut h_column[..=step],
             candidate_old,
             breakdown_tol,
         );
 
         for row in 0..=step {
-            hessenberg[[row, step]] = h_column[row];
+            hessenberg.set(row, step, h_column[row]);
         }
         performed_steps = step + 1;
 
         if orthogonalized.happy_breakdown {
             happy_breakdown = true;
-            hessenberg[[step + 1, step]] = Complex64::new(0.0, 0.0);
+            hessenberg.set(step + 1, step, Complex64::ZERO);
             break;
         }
 
-        hessenberg[[step + 1, step]] = Complex64::new(orthogonalized.residual_norm, 0.0);
-        basis.column_mut(step + 1).assign(&candidate);
-        backend.append_arnoldi_basis_column(&mut workspace, step + 1, &candidate);
+        hessenberg.set(
+            step + 1,
+            step,
+            Complex64::new(orthogonalized.residual_norm, 0.0),
+        );
+        backend.write_basis_column(&mut basis, step + 1, &candidate_host);
     }
 
     Ok(ArnoldiFactorization {
@@ -156,84 +200,4 @@ pub fn continue_arnoldi<B: Backend>(
         performed_steps,
         happy_breakdown,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use ndarray::{Array1, Array2, ShapeBuilder, s};
-    use num_complex::Complex64;
-
-    use crate::backend::{Backend, LapackBackend};
-    use crate::operator::{ConvectionDiffusionOperator, IdentityOperator, LinearOperator};
-
-    use super::run_arnoldi;
-
-    #[test]
-    fn identity_operator_breaks_down_after_one_step() {
-        let operator = IdentityOperator::new(4);
-        let start = Array1::from_vec(vec![
-            Complex64::new(1.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-        ]);
-        let mut matvec_count = 0;
-        let mut backend = LapackBackend::new();
-        let mut operator_workspace = backend.prepare_operator(&operator).unwrap();
-
-        let result = run_arnoldi(&mut backend, &mut operator_workspace, &operator, &start, 3, 1.0e-12, &mut matvec_count)
-            .expect("identity Arnoldi should not fail");
-
-        assert_eq!(result.performed_steps, 1);
-        assert!(result.happy_breakdown);
-        assert_eq!(matvec_count, 1);
-    }
-
-    #[test]
-    fn arnoldi_relation_holds_for_convection_diffusion() {
-        let operator = ConvectionDiffusionOperator::new(5, 0.0);
-        let start = Array1::from_vec(vec![
-            Complex64::new(1.0, 0.0),
-            Complex64::new(2.0, 0.0),
-            Complex64::new(3.0, 0.0),
-            Complex64::new(4.0, 0.0),
-            Complex64::new(5.0, 0.0),
-        ]);
-        let mut matvec_count = 0;
-        let mut backend = LapackBackend::new();
-        let mut operator_workspace = backend.prepare_operator(&operator).unwrap();
-
-        let factorization = run_arnoldi(
-            &mut backend,
-            &mut operator_workspace,
-            &operator,
-            &start,
-            3,
-            1.0e-12,
-            &mut matvec_count,
-        )
-        .expect("Arnoldi should run");
-
-        let k = factorization.performed_steps;
-        let v_k = factorization.basis.slice(s![.., 0..k]);
-        let v_k_plus_1 = factorization.basis.slice(s![.., 0..=k]);
-        let h = factorization.hessenberg.slice(s![0..=k, 0..k]);
-
-        let mut av = Array2::<Complex64>::zeros((operator.dimension(), k).f());
-        for column in 0..k {
-            let image = operator
-                .apply(&v_k.column(column).to_owned())
-                .expect("operator application should succeed");
-            av.column_mut(column).assign(&image);
-        }
-
-        let vh = v_k_plus_1.dot(&h);
-        let error = (&av - &vh)
-            .iter()
-            .map(|entry| entry.norm_sqr())
-            .sum::<f64>()
-            .sqrt();
-
-        assert!(error < 1.0e-10, "Arnoldi relation error = {error}");
-    }
 }

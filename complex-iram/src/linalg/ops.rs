@@ -1,244 +1,139 @@
-//! Basic vector operations and backend-specific orthogonalization kernels.
+//! Базовые операции над комплексными векторами/матрицами в формате column-major.
+//!
+//! Слой `ops` — это набор generic-примитивов, на которых живёт ядро алгоритма
+//! (Arnoldi/IRAM). Здесь нет ни одного упоминания шага Арнольди, рестарта,
+//! Ритц-пары — только линейная алгебра по непрерывным `&[Complex64]`.
 
-use ndarray::{Array1, ArrayView2, Zip};
 use num_complex::Complex64;
-use rand::{Rng, RngExt};
+use rand::Rng;
 
 use crate::error::IramError;
-use crate::linalg::lapack::{ZgemvTranspose, zgemv};
 
-#[cfg(feature = "magma")]
-use crate::linalg::magma::{DeviceMatrix, DeviceVector, MagmaSession, ZgemvTranspose as MagmaZgemvTranspose};
+pub const REORTHOGONALIZATION_THRESHOLD: f64 = f64::EPSILON * 1000.0;
 
-const REORTHOGONALIZATION_THRESHOLD: f64 = f64::EPSILON * 1000.0;
+/// Опции переноса для GEMV/GEMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trans {
+    None,
+    ConjugateTranspose,
+}
 
+/// Результат ортогонализации очередного вектора-кандидата.
 #[derive(Debug, Clone, Copy)]
 pub struct OrthogonalizedVector {
     pub residual_norm: f64,
     pub happy_breakdown: bool,
 }
 
-/// Нормализация вектора
-pub fn normalize(vector: &mut Array1<Complex64>, context: &'static str) -> Result<f64, IramError> {
-    let norm = norm2(vector);
-
-    if norm <= f64::EPSILON {
-        return Err(IramError::ZeroVector(context));
-    }
-
-    scale_in_place(vector, Complex64::new(1.0 / norm, 0.0));
-    Ok(norm)
-}
-
-/// 2-норма
-pub fn norm2(vector: &Array1<Complex64>) -> f64 {
-    norm2_slice(vector.as_slice().expect("norm2 expects contiguous vector"))
-}
-
+/// 2-норма для непрерывного среза.
 #[inline]
-pub(crate) fn norm2_slice(vector: &[Complex64]) -> f64 {
-    vector.iter().map(|entry| entry.norm_sqr()).sum::<f64>().sqrt()
+pub fn nrm2(vector: &[Complex64]) -> f64 {
+    vector
+        .iter()
+        .map(|entry| entry.norm_sqr())
+        .sum::<f64>()
+        .sqrt()
 }
 
-/// Скалярное произведение в комплексном пространстве
-pub fn inner_product(left: &Array1<Complex64>, right: &Array1<Complex64>) -> Complex64 {
+/// Скалярное произведение <x, y> = sum conj(x_i) * y_i.
+#[inline]
+pub fn dotc(left: &[Complex64], right: &[Complex64]) -> Complex64 {
+    debug_assert_eq!(left.len(), right.len());
     left.iter()
         .zip(right.iter())
-        .map(|(&left_entry, &right_entry)| left_entry.conj() * right_entry)
+        .map(|(&l, &r)| l.conj() * r)
         .sum::<Complex64>()
 }
 
-/// Проверка невязки
+/// x *= alpha
+#[inline]
+pub fn scal(vector: &mut [Complex64], alpha: Complex64) {
+    vector.iter_mut().for_each(|entry| *entry *= alpha);
+}
+
+/// y += alpha * x
+#[inline]
+pub fn axpy(target: &mut [Complex64], alpha: Complex64, source: &[Complex64]) {
+    debug_assert_eq!(target.len(), source.len());
+    for (t, &s) in target.iter_mut().zip(source.iter()) {
+        *t += alpha * s;
+    }
+}
+
+/// Нормализация. Возвращает исходную норму.
+pub fn normalize(vector: &mut [Complex64], context: &'static str) -> Result<f64, IramError> {
+    let norm = nrm2(vector);
+    if norm <= f64::EPSILON {
+        return Err(IramError::ZeroVector(context));
+    }
+    scal(vector, Complex64::new(1.0 / norm, 0.0));
+    Ok(norm)
+}
+
+/// Проверка численного breakdown.
+#[inline]
 pub fn is_numerical_breakdown(residual_norm: f64, reference_norm: f64, tolerance: f64) -> bool {
     residual_norm <= tolerance * reference_norm
 }
 
-/// x *= a
-pub fn scale_in_place(vector: &mut Array1<Complex64>, alpha: Complex64) {
-    scale_slice_in_place(
-        vector
-            .as_slice_mut()
-            .expect("scale_in_place expects contiguous vector"),
-        alpha,
-    );
-}
-
-#[inline]
-pub(crate) fn scale_slice_in_place(vector: &mut [Complex64], alpha: Complex64) {
-    vector.iter_mut().for_each(|entry| *entry *= alpha);
-}
-
-/// y += a * x
-pub fn axpy_in_place(target: &mut Array1<Complex64>, alpha: Complex64, source: &Array1<Complex64>) {
-    Zip::from(target)
-        .and(source)
-        .for_each(|target_entry, &source_entry| {
-            *target_entry += alpha * source_entry;
-        });
-}
-
-/// Reorthogonalized classical Gram-Schmidt using the LAPACK/OpenBLAS backend.
-pub fn orthogonalize_with_reorthogonalization(
-    candidate: &mut Array1<Complex64>,
-    basis: &ArrayView2<Complex64>,
+/// Reorthogonalized classical Gram-Schmidt против host-матрицы (column-major).
+///
+/// Использует BLAS-уровневые примитивы `zgemv_slice` через два прохода CGS
+/// + однократную реортогонализацию по необходимости. Это generic-операция,
+/// нужная не только Arnoldi, поэтому живёт в `ops`.
+pub fn orthogonalize_against_host_basis_slice(
+    candidate: &mut [Complex64],
+    basis: &[Complex64],
+    basis_rows: usize,
+    basis_columns: usize,
     h_column: &mut [Complex64],
     reference_norm: f64,
     breakdown_tol: f64,
 ) -> OrthogonalizedVector {
-    let (m, n) = basis.dim();
-    assert_eq!(candidate.len(), m);
-    assert!(h_column.len() >= n);
+    use crate::linalg::lapack::{ZgemvTranspose, zgemv_slice};
+
+    debug_assert_eq!(candidate.len(), basis_rows);
+    debug_assert!(basis.len() >= basis_rows * basis_columns);
+    debug_assert!(h_column.len() >= basis_columns);
 
     let one = Complex64::new(1.0, 0.0);
     let zero = Complex64::ZERO;
     let minus_one = Complex64::new(-1.0, 0.0);
-    let mut projection = vec![Complex64::ZERO; n];
+    let mut projection = vec![Complex64::ZERO; basis_columns];
 
-    {
-        let x = candidate
-            .as_slice_mut()
-            .expect("candidate must be contiguous");
+    for _ in 0..2 {
+        projection.fill(Complex64::ZERO);
 
-        for _ in 0..2 {
-            projection.fill(Complex64::ZERO);
-
-            zgemv(
-                ZgemvTranspose::ConjugateTranspose,
-                *basis,
-                one,
-                x,
-                zero,
-                &mut projection,
-            );
-
-            for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
-                *h += p;
-            }
-
-            zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
-        }
-    }
-
-    let mut residual_norm = norm2(candidate);
-    if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-        return OrthogonalizedVector {
-            residual_norm,
-            happy_breakdown: true,
-        };
-    }
-
-    scale_in_place(candidate, Complex64::new(1.0 / residual_norm, 0.0));
-
-    projection.fill(Complex64::ZERO);
-    {
-        let x = candidate
-            .as_slice_mut()
-            .expect("candidate must be contiguous");
-        zgemv(
+        zgemv_slice(
             ZgemvTranspose::ConjugateTranspose,
-            *basis,
+            basis_rows,
+            basis_columns,
             one,
-            x,
+            basis,
+            basis_rows.max(1),
+            candidate,
             zero,
             &mut projection,
         );
-    }
-
-    let correction_norm = norm2_slice(&projection);
-
-    if correction_norm > REORTHOGONALIZATION_THRESHOLD {
-        for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
-            *h += p * Complex64::new(residual_norm, 0.0);
-        }
-
-        {
-            let x = candidate
-                .as_slice_mut()
-                .expect("candidate must be contiguous");
-            zgemv(ZgemvTranspose::None, *basis, minus_one, &projection, one, x);
-        }
-
-        let reorthogonalized_norm = norm2(candidate);
-        residual_norm *= reorthogonalized_norm;
-        if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-            return OrthogonalizedVector {
-                residual_norm,
-                happy_breakdown: true,
-            };
-        }
-
-        scale_in_place(candidate, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
-    }
-
-    OrthogonalizedVector {
-        residual_norm,
-        happy_breakdown: false,
-    }
-}
-
-/// Reorthogonalized classical Gram-Schmidt against a basis that is already
-/// resident on the GPU.
-#[cfg(feature = "magma")]
-pub fn orthogonalize_with_device_basis_reorthogonalization(
-    session: &MagmaSession,
-    d_basis: &DeviceMatrix,
-    basis_columns: usize,
-    candidate: &mut Array1<Complex64>,
-    d_candidate: &mut DeviceVector,
-    d_projection: &mut DeviceVector,
-    projection: &mut [Complex64],
-    h_column: &mut [Complex64],
-    reference_norm: f64,
-    breakdown_tol: f64,
-) -> OrthogonalizedVector {
-    let m = d_basis.rows();
-    let n = basis_columns;
-    assert!(n <= d_basis.columns());
-    assert_eq!(candidate.len(), m);
-    assert_eq!(d_candidate.len(), m);
-    assert!(d_projection.len() >= n);
-    assert!(projection.len() >= n);
-    assert!(h_column.len() >= n);
-
-    let one = Complex64::new(1.0, 0.0);
-    let zero = Complex64::ZERO;
-    let minus_one = Complex64::new(-1.0, 0.0);
-
-    let x = candidate
-        .as_slice_mut()
-        .expect("candidate must be contiguous");
-    let projection = &mut projection[..n];
-
-    for _ in 0..2 {
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::ConjugateTranspose,
-            one,
-            d_candidate,
-            zero,
-            d_projection,
-        );
-        d_projection.copy_prefix_to_slice(session, projection);
 
         for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
             *h += p;
         }
 
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::None,
+        zgemv_slice(
+            ZgemvTranspose::None,
+            basis_rows,
+            basis_columns,
             minus_one,
-            d_projection,
+            basis,
+            basis_rows.max(1),
+            &projection,
             one,
-            d_candidate,
+            candidate,
         );
     }
 
-    d_candidate.copy_to_slice(session, x);
-
-    let mut residual_norm = norm2_slice(x);
+    let mut residual_norm = nrm2(candidate);
     if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
         return OrthogonalizedVector {
             residual_norm,
@@ -246,39 +141,40 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
         };
     }
 
-    scale_slice_in_place(x, Complex64::new(1.0 / residual_norm, 0.0));
-    d_candidate.copy_from_slice(session, x);
+    scal(candidate, Complex64::new(1.0 / residual_norm, 0.0));
 
-    d_basis.zgemv_leading_columns(
-        session,
-        n,
-        MagmaZgemvTranspose::ConjugateTranspose,
+    projection.fill(Complex64::ZERO);
+    zgemv_slice(
+        ZgemvTranspose::ConjugateTranspose,
+        basis_rows,
+        basis_columns,
         one,
-        d_candidate,
+        basis,
+        basis_rows.max(1),
+        candidate,
         zero,
-        d_projection,
+        &mut projection,
     );
-    d_projection.copy_prefix_to_slice(session, projection);
 
-    let correction_norm = norm2_slice(projection);
-
+    let correction_norm = nrm2(&projection);
     if correction_norm > REORTHOGONALIZATION_THRESHOLD {
         for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
             *h += p * Complex64::new(residual_norm, 0.0);
         }
 
-        d_basis.zgemv_leading_columns(
-            session,
-            n,
-            MagmaZgemvTranspose::None,
+        zgemv_slice(
+            ZgemvTranspose::None,
+            basis_rows,
+            basis_columns,
             minus_one,
-            d_projection,
+            basis,
+            basis_rows.max(1),
+            &projection,
             one,
-            d_candidate,
+            candidate,
         );
-        d_candidate.copy_to_slice(session, x);
 
-        let reorthogonalized_norm = norm2_slice(x);
+        let reorthogonalized_norm = nrm2(candidate);
         residual_norm *= reorthogonalized_norm;
         if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
             return OrthogonalizedVector {
@@ -286,9 +182,7 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
                 happy_breakdown: true,
             };
         }
-
-        scale_slice_in_place(x, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
-        d_candidate.copy_from_slice(session, x);
+        scal(candidate, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
     }
 
     OrthogonalizedVector {
@@ -297,142 +191,17 @@ pub fn orthogonalize_with_device_basis_reorthogonalization(
     }
 }
 
-/// One-shot MAGMA reorthogonalization for restart residuals.
-#[cfg(feature = "magma")]
-pub fn orthogonalize_with_magma_reorthogonalization(
-    session: &MagmaSession,
-    candidate: &mut Array1<Complex64>,
-    basis: &ArrayView2<Complex64>,
-    h_column: &mut [Complex64],
-    reference_norm: f64,
-    breakdown_tol: f64,
-) -> OrthogonalizedVector {
-    let (m, n) = basis.dim();
-    assert_eq!(candidate.len(), m);
-    assert!(h_column.len() >= n);
-
-    let one = Complex64::new(1.0, 0.0);
-    let zero = Complex64::ZERO;
-    let minus_one = Complex64::new(-1.0, 0.0);
-
-    let d_basis = DeviceMatrix::from_column_major(session, *basis);
-    let x = candidate
-        .as_slice_mut()
-        .expect("candidate must be contiguous");
-    let mut d_x = DeviceVector::from_slice(session, x);
-    let mut d_projection = DeviceVector::new(n);
-    let mut projection = vec![Complex64::ZERO; n];
-
-    for _ in 0..2 {
-        d_basis.zgemv(
-            session,
-            MagmaZgemvTranspose::ConjugateTranspose,
-            one,
-            &d_x,
-            zero,
-            &mut d_projection,
-        );
-        d_projection.copy_to_slice(session, &mut projection);
-
-        for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
-            *h += p;
-        }
-
-        d_basis.zgemv(
-            session,
-            MagmaZgemvTranspose::None,
-            minus_one,
-            &d_projection,
-            one,
-            &mut d_x,
-        );
-    }
-
-    d_x.copy_to_slice(session, x);
-
-    let mut residual_norm = norm2_slice(x);
-    if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-        return OrthogonalizedVector {
-            residual_norm,
-            happy_breakdown: true,
-        };
-    }
-
-    scale_slice_in_place(x, Complex64::new(1.0 / residual_norm, 0.0));
-    d_x.copy_from_slice(session, x);
-
-    d_basis.zgemv(
-        session,
-        MagmaZgemvTranspose::ConjugateTranspose,
-        one,
-        &d_x,
-        zero,
-        &mut d_projection,
-    );
-    d_projection.copy_to_slice(session, &mut projection);
-
-    let correction_norm = norm2_slice(&projection);
-
-    if correction_norm > REORTHOGONALIZATION_THRESHOLD {
-        for (h, &p) in h_column.iter_mut().zip(projection.iter()) {
-            *h += p * Complex64::new(residual_norm, 0.0);
-        }
-
-        d_basis.zgemv(
-            session,
-            MagmaZgemvTranspose::None,
-            minus_one,
-            &d_projection,
-            one,
-            &mut d_x,
-        );
-        d_x.copy_to_slice(session, x);
-
-        let reorthogonalized_norm = norm2_slice(x);
-        residual_norm *= reorthogonalized_norm;
-        if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
-            return OrthogonalizedVector {
-                residual_norm,
-                happy_breakdown: true,
-            };
-        }
-
-        scale_slice_in_place(x, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
-        d_x.copy_from_slice(session, x);
-    }
-
-    OrthogonalizedVector {
-        residual_norm,
-        happy_breakdown: false,
-    }
-}
-
-/// Генерация нормализованного случайного вектора
+/// Генерация нормализованного случайного вектора (host).
 pub fn normalized_random_vector<R>(
     dimension: usize,
     rng: &mut R,
-) -> Result<Array1<Complex64>, IramError>
+) -> Result<Vec<Complex64>, IramError>
 where
     R: Rng + ?Sized,
 {
-    let mut vector = Array1::from_iter(
-        (0..dimension)
-            .map(|_| Complex64::new(rng.random_range(-1.0..=1.0), rng.random_range(-1.0..=1.0))),
-    );
+    let mut vector: Vec<Complex64> = (0..dimension)
+        .map(|_| Complex64::new(rng.random_range(-1.0..=1.0), rng.random_range(-1.0..=1.0)))
+        .collect();
     normalize(&mut vector, "random start vector generation")?;
     Ok(vector)
-}
-
-/// Нормализация комплекснозначного вектора
-pub fn normalize_complex(vector: &mut Array1<Complex64>) -> Result<f64, IramError> {
-    let norm = norm2(vector);
-
-    if norm <= f64::EPSILON {
-        return Err(IramError::Spectral(
-            "complex eigenvector estimate collapsed to zero".to_string(),
-        ));
-    }
-
-    scale_in_place(vector, Complex64::new(1.0 / norm, 0.0));
-    Ok(norm)
 }

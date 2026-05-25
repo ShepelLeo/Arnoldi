@@ -1121,6 +1121,116 @@ pub fn shifted_qr_filter_with_session(
     Ok((q, h))
 }
 
+/// Slice-based MAGMA ZGEMM (column-major). Все буферы непрерывные, ld явные.
+pub fn zgemm_with_session_slice(
+    session: &MagmaSession,
+    trans_a: ZgemmTranspose,
+    trans_b: ZgemmTranspose,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[Complex64],
+    lda: usize,
+    b: &[Complex64],
+    ldb: usize,
+    c: &mut [Complex64],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    let (a_rows, a_columns) = match trans_a {
+        ZgemmTranspose::None => (m, k),
+        ZgemmTranspose::ConjugateTranspose => (k, m),
+    };
+    let (b_rows, b_columns) = match trans_b {
+        ZgemmTranspose::None => (k, n),
+        ZgemmTranspose::ConjugateTranspose => (n, k),
+    };
+
+    // Загружаем операнды на устройство.
+    let mut d_a = DeviceMatrix::new(a_rows, a_columns);
+    let mut d_b = DeviceMatrix::new(b_rows, b_columns);
+    let d_c = DeviceMatrix::new(m, n);
+
+    upload_slice_to_device_matrix(session, &mut d_a, a, lda);
+    upload_slice_to_device_matrix(session, &mut d_b, b, ldb);
+
+    unsafe {
+        magma_zgemm(
+            magma_trans(trans_a),
+            magma_trans(trans_b),
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            Complex64::new(1.0, 0.0),
+            d_a.buffer.ptr,
+            d_a.lda,
+            d_b.buffer.ptr,
+            d_b.lda,
+            Complex64::ZERO,
+            d_c.buffer.ptr,
+            d_c.lda,
+            session.queue.raw,
+        );
+    }
+
+    download_device_matrix_to_slice(session, &d_c, c, ldc);
+}
+
+fn upload_slice_to_device_matrix(
+    session: &MagmaSession,
+    device: &mut DeviceMatrix,
+    host: &[Complex64],
+    host_ld: usize,
+) {
+    let rows = device.rows;
+    let cols = device.columns;
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    assert!(host.len() >= host_ld * cols.saturating_sub(1) + rows);
+
+    unsafe {
+        magma_zsetmatrix(
+            rows as c_int,
+            cols as c_int,
+            host.as_ptr(),
+            host_ld.max(1) as c_int,
+            device.buffer.ptr,
+            device.lda,
+            session.queue.raw,
+        );
+        memory::record_host_to_device_copy(rows * cols * std::mem::size_of::<Complex64>());
+    }
+}
+
+fn download_device_matrix_to_slice(
+    session: &MagmaSession,
+    device: &DeviceMatrix,
+    host: &mut [Complex64],
+    host_ld: usize,
+) {
+    let rows = device.rows;
+    let cols = device.columns;
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    unsafe {
+        magma_zgetmatrix(
+            rows as c_int,
+            cols as c_int,
+            device.buffer.ptr,
+            device.lda,
+            host.as_mut_ptr(),
+            host_ld.max(1) as c_int,
+            session.queue.raw,
+        );
+        memory::record_device_to_host_copy(rows * cols * std::mem::size_of::<Complex64>());
+    }
+}
+
 pub fn zgemm_with_session(
     session: &MagmaSession,
     trans_a: ZgemmTranspose,
@@ -1233,6 +1343,93 @@ fn scale_slice(values: &mut [Complex64], beta: Complex64) {
 /// a true Schur decomposition.
 pub fn zgeev_right_eigenpairs(h: &Array2<Complex64>) -> Result<SchurOutput, SchurError> {
     magma_zgeev_right(h)
+}
+
+/// Slice-based `zgeev`: вход — column-major n×n, выход — eigenvalues +
+/// правые собственные векторы в column-major (`dim × dim`, ld = dim).
+pub fn zgeev_right_eigenpairs_slice(
+    h_col_major: &[Complex64],
+    n: usize,
+) -> Result<SchurOutput, SchurError> {
+    if h_col_major.len() != n * n {
+        return Err(SchurError::DimensionMismatch);
+    }
+
+    if n == 0 {
+        return Ok(SchurOutput {
+            w: Vec::new(),
+            t: Vec::new(),
+            z: Vec::new(),
+        });
+    }
+
+    ensure_magma_initialized();
+    let n_i = n as c_int;
+    let mut a_col = h_col_major.to_vec();
+    let mut w = vec![zero(); n];
+    let mut vl_dummy = [zero(); 1];
+    let mut z = vec![zero(); n * n];
+    let mut rwork = vec![0.0; 2 * n];
+    let mut work_query = [zero(); 1];
+    let mut info = 0_i32;
+
+    unsafe {
+        magma_zgeev(
+            MAGMA_NO_VEC,
+            MAGMA_VEC,
+            n_i,
+            a_col.as_mut_ptr(),
+            n_i,
+            w.as_mut_ptr(),
+            vl_dummy.as_mut_ptr(),
+            1,
+            z.as_mut_ptr(),
+            n_i,
+            work_query.as_mut_ptr(),
+            -1,
+            rwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+
+    if info < 0 {
+        return Err(SchurError::MagmaIllegalArgument(-info));
+    }
+    if info > 0 {
+        return Err(SchurError::NoConvergence(info));
+    }
+
+    let lwork = (work_query[0].re as i32).max(2 * n_i).max(1);
+    let mut work = vec![zero(); lwork as usize];
+    let mut info = 0_i32;
+
+    unsafe {
+        magma_zgeev(
+            MAGMA_NO_VEC,
+            MAGMA_VEC,
+            n_i,
+            a_col.as_mut_ptr(),
+            n_i,
+            w.as_mut_ptr(),
+            vl_dummy.as_mut_ptr(),
+            1,
+            z.as_mut_ptr(),
+            n_i,
+            work.as_mut_ptr(),
+            lwork,
+            rwork.as_mut_ptr(),
+            &mut info,
+        );
+    }
+
+    if info < 0 {
+        return Err(SchurError::MagmaIllegalArgument(-info));
+    }
+    if info > 0 {
+        return Err(SchurError::NoConvergence(info));
+    }
+
+    Ok(SchurOutput { w, t: a_col, z })
 }
 
 /// Backward-compatible alias for older call sites.

@@ -1,26 +1,37 @@
-use ndarray::{Array1, Array2, ArrayView2};
+//! MAGMA / cuSPARSE-бэкенд для нового generic-API.
+//!
+//! Базис Крылова, текущий кандидат и проекция владеются устройством через
+//! `DeviceMatrix` / `DeviceVector`. Ядро работает только со срезами на хосте;
+//! бэкенд сам синхронизирует device-зеркало.
+
 use num_complex::Complex64;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, DenseColMajor, SmallEig};
 use crate::error::IramError;
 use crate::linalg::magma::{
-    self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, MagmaSession, SchurOutput, ZgemmTranspose,
+    DeviceCsrMatrix, DeviceMatrix, DeviceVector, MagmaSession, ZgemmTranspose,
+    ZgemvTranspose as MagmaZgemvTranspose, zgemm_with_session_slice,
+    zgeev_right_eigenpairs_slice,
 };
 use crate::linalg::ops::{
-    OrthogonalizedVector, orthogonalize_with_device_basis_reorthogonalization,
-    orthogonalize_with_magma_reorthogonalization,
+    OrthogonalizedVector, REORTHOGONALIZATION_THRESHOLD, Trans, is_numerical_breakdown, nrm2,
+    scal,
 };
+use crate::linalg::shifted_qr::shifted_qr_filter_slice;
 use crate::operator::LinearOperator;
 
-pub struct MagmaOperatorWorkspace {
+pub struct MagmaOperatorHandle {
     d_operator: DeviceCsrMatrix,
 }
 
-pub struct MagmaArnoldiWorkspace {
+pub struct MagmaBasisHandle {
     d_basis: DeviceMatrix,
-    d_candidate: DeviceVector,
-    d_projection: DeviceVector,
-    projection: Vec<Complex64>,
+    rows: usize,
+    capacity: usize,
+}
+
+pub struct MagmaVectorHandle {
+    d_vector: DeviceVector,
 }
 
 pub struct MagmaBackend {
@@ -41,10 +52,190 @@ impl Default for MagmaBackend {
     }
 }
 
+fn trans_to_zgemm(trans: Trans) -> ZgemmTranspose {
+    match trans {
+        Trans::None => ZgemmTranspose::None,
+        Trans::ConjugateTranspose => ZgemmTranspose::ConjugateTranspose,
+    }
+}
+
+/// CGS + однократная реортогонализация. Базис — устройство, кандидат — пара
+/// (host, device).
+fn orthogonalize_against_device_basis(
+    session: &MagmaSession,
+    d_basis: &DeviceMatrix,
+    basis_columns: usize,
+    candidate_host: &mut [Complex64],
+    d_candidate: &mut DeviceVector,
+    d_projection: &mut DeviceVector,
+    projection_host: &mut [Complex64],
+    h_column: &mut [Complex64],
+    reference_norm: f64,
+    breakdown_tol: f64,
+) -> OrthogonalizedVector {
+    let m = d_basis.rows();
+    let n = basis_columns;
+    debug_assert!(n <= d_basis.columns());
+    debug_assert_eq!(candidate_host.len(), m);
+    debug_assert_eq!(d_candidate.len(), m);
+    debug_assert!(d_projection.len() >= n);
+    debug_assert!(projection_host.len() >= n);
+    debug_assert!(h_column.len() >= n);
+
+    let one = Complex64::new(1.0, 0.0);
+    let zero = Complex64::ZERO;
+    let minus_one = Complex64::new(-1.0, 0.0);
+    let projection_host = &mut projection_host[..n];
+
+    for _ in 0..2 {
+        d_basis.zgemv_leading_columns(
+            session,
+            n,
+            MagmaZgemvTranspose::ConjugateTranspose,
+            one,
+            d_candidate,
+            zero,
+            d_projection,
+        );
+        d_projection.copy_prefix_to_slice(session, projection_host);
+
+        for (h, &p) in h_column.iter_mut().zip(projection_host.iter()) {
+            *h += p;
+        }
+
+        d_basis.zgemv_leading_columns(
+            session,
+            n,
+            MagmaZgemvTranspose::None,
+            minus_one,
+            d_projection,
+            one,
+            d_candidate,
+        );
+    }
+
+    d_candidate.copy_to_slice(session, candidate_host);
+
+    let mut residual_norm = nrm2(candidate_host);
+    if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
+        return OrthogonalizedVector {
+            residual_norm,
+            happy_breakdown: true,
+        };
+    }
+
+    scal(candidate_host, Complex64::new(1.0 / residual_norm, 0.0));
+    d_candidate.copy_from_slice(session, candidate_host);
+
+    d_basis.zgemv_leading_columns(
+        session,
+        n,
+        MagmaZgemvTranspose::ConjugateTranspose,
+        one,
+        d_candidate,
+        zero,
+        d_projection,
+    );
+    d_projection.copy_prefix_to_slice(session, projection_host);
+
+    let correction_norm = nrm2(projection_host);
+
+    if correction_norm > REORTHOGONALIZATION_THRESHOLD {
+        for (h, &p) in h_column.iter_mut().zip(projection_host.iter()) {
+            *h += p * Complex64::new(residual_norm, 0.0);
+        }
+
+        d_basis.zgemv_leading_columns(
+            session,
+            n,
+            MagmaZgemvTranspose::None,
+            minus_one,
+            d_projection,
+            one,
+            d_candidate,
+        );
+        d_candidate.copy_to_slice(session, candidate_host);
+
+        let reorthogonalized_norm = nrm2(candidate_host);
+        residual_norm *= reorthogonalized_norm;
+        if is_numerical_breakdown(residual_norm, reference_norm, breakdown_tol) {
+            return OrthogonalizedVector {
+                residual_norm,
+                happy_breakdown: true,
+            };
+        }
+        scal(candidate_host, Complex64::new(1.0 / reorthogonalized_norm, 0.0));
+        d_candidate.copy_from_slice(session, candidate_host);
+    }
+
+    OrthogonalizedVector {
+        residual_norm,
+        happy_breakdown: false,
+    }
+}
+
+/// CGS + реортогонализация для host-базиса (используется на рестарте). Сначала
+/// host -> device загрузка, потом то же ядро.
+fn orthogonalize_against_host_basis_via_magma(
+    session: &MagmaSession,
+    candidate_host: &mut [Complex64],
+    basis_host: &[Complex64],
+    basis_rows: usize,
+    basis_columns: usize,
+    h_column: &mut [Complex64],
+    reference_norm: f64,
+    breakdown_tol: f64,
+) -> OrthogonalizedVector {
+    debug_assert_eq!(candidate_host.len(), basis_rows);
+    debug_assert!(basis_host.len() >= basis_rows * basis_columns);
+    debug_assert!(h_column.len() >= basis_columns);
+
+    let mut d_basis = DeviceMatrix::new(basis_rows, basis_columns);
+    // Загрузим host-базис на устройство (rows × cols, ld = rows).
+    upload_host_to_device_matrix(session, &mut d_basis, basis_host, basis_rows);
+
+    let mut d_candidate = DeviceVector::from_slice(session, candidate_host);
+    let mut d_projection = DeviceVector::new(basis_columns);
+    let mut projection_host = vec![Complex64::ZERO; basis_columns];
+
+    orthogonalize_against_device_basis(
+        session,
+        &d_basis,
+        basis_columns,
+        candidate_host,
+        &mut d_candidate,
+        &mut d_projection,
+        &mut projection_host,
+        h_column,
+        reference_norm,
+        breakdown_tol,
+    )
+}
+
+fn upload_host_to_device_matrix(
+    session: &MagmaSession,
+    device: &mut DeviceMatrix,
+    host: &[Complex64],
+    host_ld: usize,
+) {
+    let rows = device.rows();
+    let cols = device.columns();
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // Загружаем колоночно, чтобы не дёргать magma_zsetmatrix-internal
+    // напрямую из публичного API.
+    for col in 0..cols {
+        let start = col * host_ld;
+        let column_slice = &host[start..start + rows];
+        device.copy_column_from_slice(session, col, column_slice);
+    }
+}
+
 impl Backend for MagmaBackend {
-    type OperatorWorkspace = MagmaOperatorWorkspace;
-    type ArnoldiWorkspace = MagmaArnoldiWorkspace;
-    type RitzDecomposition = SchurOutput;
+    type OperatorHandle = MagmaOperatorHandle;
+    type BasisHandle = MagmaBasisHandle;
+    type VectorHandle = MagmaVectorHandle;
 
     fn name(&self) -> &'static str {
         "magma"
@@ -53,7 +244,7 @@ impl Backend for MagmaBackend {
     fn prepare_operator(
         &mut self,
         operator: &dyn LinearOperator,
-    ) -> Result<Self::OperatorWorkspace, IramError> {
+    ) -> Result<Self::OperatorHandle, IramError> {
         let csr = operator.csr_matrix().ok_or_else(|| {
             IramError::InvalidConfig(format!(
                 "MAGMA backend requires a CSR-materializable operator for cuSPARSE matvec; '{}' does not provide one",
@@ -71,152 +262,231 @@ impl Backend for MagmaBackend {
         )
         .map_err(|error| IramError::Spectral(format!("cuSPARSE CSR upload failed: {error:?}")))?;
 
-        Ok(MagmaOperatorWorkspace { d_operator })
+        Ok(MagmaOperatorHandle { d_operator })
     }
 
-    fn create_arnoldi_workspace(
+    fn alloc_basis(
         &mut self,
-        basis: &Array2<Complex64>,
         dimension: usize,
-    ) -> Result<Self::ArnoldiWorkspace, IramError> {
-        Ok(MagmaArnoldiWorkspace {
-            d_basis: DeviceMatrix::from_column_major(&self.session, basis.view()),
-            d_candidate: DeviceVector::new(dimension),
-            d_projection: DeviceVector::new(basis.ncols()),
-            projection: vec![Complex64::ZERO; basis.ncols()],
+        capacity: usize,
+    ) -> Result<Self::BasisHandle, IramError> {
+        Ok(MagmaBasisHandle {
+            d_basis: DeviceMatrix::new(dimension, capacity),
+            rows: dimension,
+            capacity,
         })
     }
 
-    fn apply_operator_to_basis_vector(
-        &mut self,
-        operator_workspace: &mut Self::OperatorWorkspace,
-        arnoldi_workspace: &mut Self::ArnoldiWorkspace,
-        _operator: &dyn LinearOperator,
-        _basis: &Array2<Complex64>,
-        column: usize,
-        output: &mut Array1<Complex64>,
-    ) -> Result<(), IramError> {
-        let x = arnoldi_workspace.d_basis.column_ptr(column);
-        let y = arnoldi_workspace.d_candidate.mut_ptr();
-        operator_workspace
-            .d_operator
-            .spmv_raw(&self.session, x, y)
-            .map_err(|error| IramError::Spectral(format!("cuSPARSE SpMV failed: {error:?}")))?;
-
-        let output_slice = output
-            .as_slice_mut()
-            .expect("Arnoldi candidate must be contiguous");
-        arnoldi_workspace
-            .d_candidate
-            .copy_to_slice(&self.session, output_slice);
-        Ok(())
+    fn alloc_vector(&mut self, dimension: usize) -> Result<Self::VectorHandle, IramError> {
+        Ok(MagmaVectorHandle {
+            d_vector: DeviceVector::new(dimension),
+        })
     }
 
-    fn orthogonalize_arnoldi_candidate(
+    fn write_basis_column(
         &mut self,
-        workspace: &mut Self::ArnoldiWorkspace,
-        _basis: &Array2<Complex64>,
-        basis_columns: usize,
-        candidate: &mut Array1<Complex64>,
-        h_column: &mut [Complex64],
-        reference_norm: f64,
-        breakdown_tol: f64,
-    ) -> OrthogonalizedVector {
-        // `apply_operator_to_basis_vector` has already written the candidate to
-        // `workspace.d_candidate`. Re-uploading `candidate` here creates a full
-        // host -> device copy on every Arnoldi step and cancels much of the
-        // benefit of doing matvec on the GPU.
-        //
-        // The host `candidate` remains a mirror used for norm/breakdown logic;
-        // the device vector is the source of truth for the BLAS projections.
-        orthogonalize_with_device_basis_reorthogonalization(
-            &self.session,
-            &workspace.d_basis,
-            basis_columns,
-            candidate,
-            &mut workspace.d_candidate,
-            &mut workspace.d_projection,
-            &mut workspace.projection[..basis_columns],
-            h_column,
-            reference_norm,
-            breakdown_tol,
-        )
-    }
-
-    fn append_arnoldi_basis_column(
-        &mut self,
-        workspace: &mut Self::ArnoldiWorkspace,
+        basis: &mut Self::BasisHandle,
         column: usize,
-        values: &Array1<Complex64>,
+        values: &[Complex64],
     ) {
-        let values = values
-            .as_slice()
-            .expect("Arnoldi basis column must be contiguous");
-        workspace
+        basis
             .d_basis
             .copy_column_from_slice(&self.session, column, values);
     }
 
-    fn orthogonalize_restart_residual(
+    fn read_basis_column(
         &mut self,
-        residual: &mut Array1<Complex64>,
-        basis: &ArrayView2<'_, Complex64>,
+        basis: &Self::BasisHandle,
+        column: usize,
+        out: &mut [Complex64],
+    ) {
+        debug_assert!(column < basis.capacity);
+        debug_assert_eq!(out.len(), basis.rows);
+        unsafe_copy_basis_column_to_host(&self.session, &basis.d_basis, column, out);
+    }
+
+    fn write_vector(&mut self, vector: &mut Self::VectorHandle, values: &[Complex64]) {
+        vector.d_vector.copy_from_slice(&self.session, values);
+    }
+
+    fn read_vector(&mut self, vector: &Self::VectorHandle, out: &mut [Complex64]) {
+        vector.d_vector.copy_to_slice(&self.session, out);
+    }
+
+    fn spmv_basis_column(
+        &mut self,
+        operator: &mut Self::OperatorHandle,
+        _operator_obj: &dyn LinearOperator,
+        basis: &Self::BasisHandle,
+        column: usize,
+        out_vector: &mut Self::VectorHandle,
+        out_host_mirror: &mut [Complex64],
+    ) -> Result<(), IramError> {
+        let x = basis.d_basis.column_ptr(column);
+        let y = out_vector.d_vector.mut_ptr();
+        operator
+            .d_operator
+            .spmv_raw(&self.session, x, y)
+            .map_err(|error| IramError::Spectral(format!("cuSPARSE SpMV failed: {error:?}")))?;
+        out_vector
+            .d_vector
+            .copy_to_slice(&self.session, out_host_mirror);
+        Ok(())
+    }
+
+    fn orthogonalize_against_basis(
+        &mut self,
+        basis: &Self::BasisHandle,
+        basis_columns: usize,
+        candidate_host: &mut [Complex64],
+        candidate_vec: &mut Self::VectorHandle,
         h_column: &mut [Complex64],
         reference_norm: f64,
         breakdown_tol: f64,
     ) -> OrthogonalizedVector {
-        orthogonalize_with_magma_reorthogonalization(
+        // Прокидываем рабочие буферы basis (d_projection, projection_host)
+        // через unsafe-окно: мы не можем мутировать `basis: &Self::BasisHandle`,
+        // поэтому держим отдельные временные буферы.
+        let mut d_projection = DeviceVector::new(basis_columns);
+        let mut projection_host = vec![Complex64::ZERO; basis_columns];
+
+        orthogonalize_against_device_basis(
             &self.session,
-            residual,
-            basis,
+            &basis.d_basis,
+            basis_columns,
+            candidate_host,
+            &mut candidate_vec.d_vector,
+            &mut d_projection,
+            &mut projection_host,
             h_column,
             reference_norm,
             breakdown_tol,
         )
     }
 
-    fn shifted_qr_filter(
+    fn orthogonalize_against_host_basis(
         &mut self,
-        hessenberg: &Array2<Complex64>,
+        residual: &mut [Complex64],
+        basis: &[Complex64],
+        basis_rows: usize,
+        basis_columns: usize,
+        h_column: &mut [Complex64],
+        reference_norm: f64,
+        breakdown_tol: f64,
+    ) -> OrthogonalizedVector {
+        orthogonalize_against_host_basis_via_magma(
+            &self.session,
+            residual,
+            basis,
+            basis_rows,
+            basis_columns,
+            h_column,
+            reference_norm,
+            breakdown_tol,
+        )
+    }
+
+    fn gemm(
+        &mut self,
+        trans_a: Trans,
+        trans_b: Trans,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[Complex64],
+        lda: usize,
+        b: &[Complex64],
+        ldb: usize,
+        c: &mut [Complex64],
+        ldc: usize,
+    ) {
+        zgemm_with_session_slice(
+            &self.session,
+            trans_to_zgemm(trans_a),
+            trans_to_zgemm(trans_b),
+            m,
+            n,
+            k,
+            a,
+            lda,
+            b,
+            ldb,
+            c,
+            ldc,
+        );
+    }
+
+    fn multishift_qr_filter(
+        &mut self,
+        hessenberg: &DenseColMajor,
         shifts: &[Complex64],
-    ) -> Result<(Array2<Complex64>, Array2<Complex64>), IramError> {
-        // The shifted QR problem here is tiny (ncv ~= 200). The CUDA prototype
-        // moves H/Q to the device, launches a mostly serial kernel, and copies
-        // both matrices back on every restart. That is slower than the CPU path
-        // and increases device allocations/transfers, so keep QR on host until
-        // restart rotation is fused into a fully device-resident pipeline.
-        crate::linalg::shifted_qr::shifted_qr_filter(hessenberg, shifts)
-            .map_err(IramError::Spectral)
+    ) -> Result<(DenseColMajor, DenseColMajor), IramError> {
+        // Маленький Хессенберг (ncv ~ 200). CUDA-прототип медленнее CPU-пути
+        // и плодит D2H/H2D-трафик. Держим QR на хосте, пока рестартная
+        // ротация не интегрирована в device-resident pipeline.
+        if hessenberg.rows != hessenberg.cols {
+            return Err(IramError::Spectral(
+                "multishift QR expects a square Hessenberg matrix".to_string(),
+            ));
+        }
+        let n = hessenberg.rows;
+        let (q, h) = shifted_qr_filter_slice(&hessenberg.data, n, shifts)
+            .map_err(IramError::Spectral)?;
+        Ok((
+            DenseColMajor {
+                data: q,
+                rows: n,
+                cols: n,
+            },
+            DenseColMajor {
+                data: h,
+                rows: n,
+                cols: n,
+            },
+        ))
     }
 
-    fn compute_ritz_values(
-        &mut self,
-        hessenberg: &Array2<Complex64>,
-    ) -> Result<Self::RitzDecomposition, IramError> {
-        magma::zgeev_right_eigenpairs(hessenberg)
-            .map_err(|error| IramError::Spectral(format!("small Ritz problem failed: {error:?}")))
-    }
-
-    fn ritz_values<'a>(&self, decomposition: &'a Self::RitzDecomposition) -> &'a [Complex64] {
-        &decomposition.w
-    }
-
-    fn retrieve_ritz_vectors(
-        &mut self,
-        decomposition: &mut Self::RitzDecomposition,
-        ritz_indices: &[usize],
-        dim: usize,
-    ) -> Result<Array2<Complex64>, IramError> {
-        magma::select_right_eigenvectors(decomposition, ritz_indices, dim).map_err(|error| {
-            IramError::Spectral(format!("Ritz vector extraction failed: {error:?}"))
+    fn small_eig(&mut self, matrix: &DenseColMajor) -> Result<SmallEig, IramError> {
+        if matrix.rows != matrix.cols {
+            return Err(IramError::Spectral(
+                "small_eig expects a square matrix".to_string(),
+            ));
+        }
+        let n = matrix.rows;
+        let schur = zgeev_right_eigenpairs_slice(&matrix.data, n).map_err(|error| {
+            IramError::Spectral(format!("magma_zgeev failed: {error:?}"))
+        })?;
+        // У zgeev собственные векторы уже лежат в `schur.z`, column-major dim×dim.
+        Ok(SmallEig {
+            values: schur.w,
+            vectors: schur.z,
+            dim: n,
         })
     }
+}
 
-    fn zgemm_nn(
-        &mut self,
-        a: ArrayView2<'_, Complex64>,
-        b: ArrayView2<'_, Complex64>,
-    ) -> Array2<Complex64> {
-        magma::zgemm_with_session(&self.session, ZgemmTranspose::None, ZgemmTranspose::None, a, b)
+/// Скачивает одну колонку базиса на host. Используется только редким путём
+/// рестарта; в горячем цикле Арнольди мы не читаем базис на host.
+///
+/// Текущая публичная поверхность `linalg::magma` не предоставляет
+/// "скачать одну колонку", поэтому пока тянем целиком и вырезаем срез.
+/// Дальнейшая оптимизация: добавить `DeviceMatrix::copy_column_to_slice`
+/// и использовать его здесь.
+fn unsafe_copy_basis_column_to_host(
+    session: &MagmaSession,
+    d_basis: &DeviceMatrix,
+    column: usize,
+    out: &mut [Complex64],
+) {
+    let rows = d_basis.rows();
+    debug_assert!(column < d_basis.columns());
+    debug_assert_eq!(out.len(), rows);
+    if rows == 0 {
+        return;
     }
+
+    let mut tmp_host = vec![Complex64::ZERO; rows * d_basis.columns()];
+    d_basis.copy_to_column_major(session, &mut tmp_host);
+    let start = column * rows;
+    out.copy_from_slice(&tmp_host[start..start + rows]);
 }

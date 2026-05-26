@@ -207,6 +207,14 @@ unsafe extern "C" {
     fn cusparseCreate(handle: *mut CusparseHandle) -> CusparseStatus;
     fn cusparseDestroy(handle: CusparseHandle) -> CusparseStatus;
 
+    // Минимальный набор CUDA Runtime API, нужный для форсирования primary
+    // CUDA context на текущем CPU-thread до вызова `cusparseCreate`.
+    // `cudart` уже линкуется через build.rs.
+    fn cudaSetDevice(device: c_int) -> c_int;
+    fn cudaGetDevice(device: *mut c_int) -> c_int;
+    fn cudaFree(ptr: *mut c_void) -> c_int;
+    fn cudaGetLastError() -> c_int;
+
     // CUDA 12.x больше не экспортирует устаревший `cusparseZcsrmv`;
     // C++/CUDA TU реализует эту обёртку поверх `cusparseSpMV`.
     fn complex_iram_cusparse_zcsrmv(
@@ -444,16 +452,38 @@ struct CusparseContext {
 
 impl CusparseContext {
     fn new() -> Self {
+        // cuSPARSE требует валидный primary CUDA context, привязанный к
+        // текущему CPU-thread. `ensure_magma_initialized` уже выполняет
+        // `magma_init` + `cudaSetDevice` + `cudaFree(NULL)` warm-up на
+        // первом входе в модуль, поэтому здесь достаточно повторно
+        // проверить, что инициализация состоялась.
+        ensure_magma_initialized();
+
         let mut raw = ptr::null_mut();
         let status = unsafe { cusparseCreate(&mut raw) };
-        assert_eq!(status, CUSPARSE_SUCCESS, "cusparseCreate failed with status {status}");
-        assert!(!raw.is_null(), "cusparseCreate returned a null handle");
+        if status != CUSPARSE_SUCCESS || raw.is_null() {
+            // Сообщение со списком переменных среды, которые чаще всего
+            // приводят к этой ошибке на SLURM-узлах.
+            panic!(
+                "cusparseCreate failed (status {status}, handle null = {is_null}). \
+                 Likely the CUDA primary context is not initialized for this \
+                 thread/process. On SLURM make sure CUDA_VISIBLE_DEVICES is set, \
+                 the node actually has a GPU allocated to this job, and that \
+                 LD_LIBRARY_PATH points at the same CUDA runtime as the one \
+                 used to build the cuSPARSE wrapper (libcusparse.so, \
+                 libcudart.so).",
+                is_null = raw.is_null(),
+            );
+        }
         Self { raw }
     }
 }
 
 impl Drop for CusparseContext {
     fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
         unsafe {
             cusparseDestroy(self.raw);
         }
@@ -463,8 +493,69 @@ impl Drop for CusparseContext {
 fn ensure_magma_initialized() {
     MAGMA_INIT.call_once(|| {
         let status = unsafe { magma_init() };
-        assert_eq!(status, MAGMA_SUCCESS, "magma_init failed with status {status}");
+        if status != MAGMA_SUCCESS {
+            panic!(
+                "magma_init failed with status {status}. \
+                 Verify MAGMA_DIR / MAGMA_LIB_DIR at build time and that the \
+                 runtime CUDA driver/runtime matches the one MAGMA was built against."
+            );
+        }
+        // Прогреваем CUDA Runtime primary context сразу после `magma_init`,
+        // чтобы любой последующий вызов (cuSPARSE, MAGMA queue create,
+        // magma_zsetvector в `DeviceI32Buffer::from_slice`, и т.д.) уже видел
+        // привязанный context на этом thread.
+        prime_cuda_runtime_context();
     });
+}
+
+/// Force-create a CUDA primary context on the current thread.
+///
+/// Called once from `ensure_magma_initialized`. The MAGMA driver-level context
+/// is created by `magma_init`, but `cusparseCreate` and some MAGMA Runtime API
+/// calls assume the CUDA Runtime API primary context is also bound to the
+/// caller's thread. On a freshly-spawned Slurm task that's not guaranteed —
+/// the Runtime primary context is materialized lazily on the first Runtime
+/// call. We make that first call explicit:
+///
+/// 1. `magma_getdevice` — pick the device MAGMA is using.
+/// 2. `cudaSetDevice(dev)` — bind the Runtime context to this thread.
+/// 3. `cudaFree(NULL)` — canonical zero-cost warm-up that materializes the
+///    Runtime primary context if it hasn't been created yet.
+fn prime_cuda_runtime_context() {
+    let mut device: c_int = 0;
+    unsafe {
+        magma_getdevice(&mut device);
+    }
+
+    let set_status = unsafe { cudaSetDevice(device) };
+    if set_status != 0 {
+        let _ = unsafe { cudaGetLastError() };
+        panic!(
+            "cudaSetDevice({device}) failed with CUDA error {set_status}. \
+             Check CUDA_VISIBLE_DEVICES and that the Slurm job actually has a \
+             GPU allocated."
+        );
+    }
+
+    let free_status = unsafe { cudaFree(ptr::null_mut()) };
+    if free_status != 0 {
+        let _ = unsafe { cudaGetLastError() };
+        panic!(
+            "cudaFree(NULL) warm-up failed with CUDA error {free_status} on \
+             device {device}. The CUDA Runtime primary context could not be \
+             created — likely no GPU is visible to this process."
+        );
+    }
+
+    let mut bound: c_int = -1;
+    let get_status = unsafe { cudaGetDevice(&mut bound) };
+    if get_status != 0 || bound < 0 {
+        let _ = unsafe { cudaGetLastError() };
+        panic!(
+            "cudaGetDevice failed (status {get_status}, bound = {bound}) after \
+             warm-up. CUDA context creation appears to have silently failed."
+        );
+    }
 }
 
 #[inline]
